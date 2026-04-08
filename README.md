@@ -154,6 +154,11 @@ tireddetect/
    - 提取人脸特征
    - 与数据库中的特征比对
    - 返回识别结果
+<img width="1116" height="779" alt="image" src="https://github.com/user-attachments/assets/f7895213-2886-4e88-92ff-1cb22a1c6934" />
+
+<img width="1341" height="1190" alt="image" src="https://github.com/user-attachments/assets/b6fa0e5d-b8e2-44ad-a274-09a99470295b" />
+
+
 
 ### 5.3 登录流程
 
