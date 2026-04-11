@@ -37,8 +37,8 @@ class FatigueDetector:
             self.predictor = dlib.shape_predictor('shape_predictor_68_face_landmarks.dat')
             
             # 加载人脸识别模型
-            device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-            self.face_net = InceptionResnetV1().to(device)
+            self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+            self.face_net = InceptionResnetV1().to(self.device)
             self.face_net.load_state_dict(torch.load('resources/weights/facenet_best_server.pt', map_location='cpu'))
             self.face_net.eval()
             
@@ -51,11 +51,12 @@ class FatigueDetector:
     
     def get_face_feat(self, face_img):
         try:
+            import numpy as np
             face_img = cv2.resize(face_img, dsize=(112, 112))
             face_img = (face_img - 127.5) / 127.5
             face_img = np.transpose(face_img, (2, 0, 1))
             face_img = np.expand_dims(face_img, axis=0)
-            face_img_tensor = torch.Tensor(face_img)
+            face_img_tensor = torch.Tensor(face_img).to(self.device)
             face_feat_tensor = self.face_net(face_img_tensor)
             face_feat = face_feat_tensor.detach().cpu().numpy()
             return face_feat

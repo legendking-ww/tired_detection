@@ -2,7 +2,13 @@ import cv2
 import numpy as np
 import sqlite3
 import json
-from .fatigue_detection import FatigueDetector
+import sys
+import os
+
+# 添加项目根目录到Python路径
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
+from src.core.fatigue_detection import FatigueDetector
 
 class FaceRecognition:
     def __init__(self, db_path='mrsoft.db'):
@@ -107,28 +113,34 @@ class FaceRecognition:
     
     def get_all_face_features(self):
         """获取所有人脸特征"""
-        conn = self.get_db_connection()
-        if conn:
-            try:
-                cursor = conn.cursor()
-                cursor.execute("SELECT id, name, features FROM faces")
-                rows = cursor.fetchall()
-                face_data = []
-                for row in rows:
-                    face_id, name, features_json = row
-                    features = np.array(json.loads(features_json))
-                    face_data.append((face_id, name, features))
-                return face_data
-            except Exception as e:
-                print(f"获取人脸特征失败: {e}")
-                return []
-            finally:
-                conn.close()
-        return []
+        try:
+            import numpy as np
+            conn = self.get_db_connection()
+            if conn:
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT id, name, features FROM faces")
+                    rows = cursor.fetchall()
+                    face_data = []
+                    for row in rows:
+                        face_id, name, features_json = row
+                        features = np.array(json.loads(features_json))
+                        face_data.append((face_id, name, features))
+                    return face_data
+                except Exception as e:
+                    print(f"获取人脸特征失败: {e}")
+                    return []
+                finally:
+                    conn.close()
+            return []
+        except Exception as e:
+            print(f"获取人脸特征失败: {e}")
+            return []
     
     def recognize_face(self, face_img):
         """识别人脸"""
         try:
+            import numpy as np
             # 提取当前人脸特征
             current_feat = self.fatigue_detector.get_face_feat(face_img)
             if current_feat is None:

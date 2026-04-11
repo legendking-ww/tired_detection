@@ -496,6 +496,7 @@ class LoginWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.face_recognition = FaceRecognition('mrsoft.db')
+        self.face_login_running = False
         self.initUI()
 
     def initUI(self):
@@ -590,6 +591,14 @@ class LoginWindow(QWidget):
         self.face_status_label.setFixedHeight(40)
         right_layout.addWidget(self.face_status_label)
         
+        # 停止按钮
+        self.stop_face_login_button = QPushButton('停止')
+        self.stop_face_login_button.setFixedSize(250, 40)
+        self.stop_face_login_button.setStyleSheet('QPushButton { background-color: #f44336; color: white; border: none; border-radius: 4px; font-size: 14px; } QPushButton:hover { background-color: #d32f2f; }')
+        self.stop_face_login_button.setEnabled(False)
+        right_layout.addWidget(self.stop_face_login_button)
+        self.stop_face_login_button.clicked.connect(self.stop_face_login)
+        
         # 将左右区域添加到主布局
         main_layout.addWidget(left_widget)
         main_layout.addWidget(right_widget)
@@ -632,17 +641,21 @@ class LoginWindow(QWidget):
         
     def face_login(self):
         """人脸识别登录"""
+        self.face_login_running = True
+        self.stop_face_login_button.setEnabled(True)
         self.face_status_label.setText('正在启动摄像头...')
         
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
             QMessageBox.warning(self, '错误', '无法打开摄像头！')
             self.face_status_label.setText('摄像头打开失败')
+            self.face_login_running = False
+            self.stop_face_login_button.setEnabled(False)
             return
         
         self.face_status_label.setText('请面对摄像头...')
         
-        while True:
+        while self.face_login_running:
             ret, frame = cap.read()
             if not ret:
                 QMessageBox.warning(self, '错误', '无法读取摄像头帧！')
@@ -669,6 +682,9 @@ class LoginWindow(QWidget):
                                 self.face_status_label.setText(f'识别成功: {name}')
                                 QMessageBox.information(self, '成功', f'人脸识别成功！欢迎回来，{name}')
                                 cap.release()
+                                cv2.destroyAllWindows()
+                                self.face_login_running = False
+                                self.stop_face_login_button.setEnabled(False)
                                 self.new_window = MainWindow()
                                 self.new_window.show()
                                 self.close()  # 关闭登录窗口
@@ -681,6 +697,15 @@ class LoginWindow(QWidget):
         
         cap.release()
         cv2.destroyAllWindows()
+        self.face_login_running = False
+        self.stop_face_login_button.setEnabled(False)
+        self.face_status_label.setText('请点击人脸识别登录按钮')
+    
+    def stop_face_login(self):
+        """停止人脸识别登录"""
+        self.face_login_running = False
+        self.stop_face_login_button.setEnabled(False)
+        self.face_status_label.setText('人脸识别已停止')
 
 class RegistrationWindow(QWidget):
     def __init__(self):
