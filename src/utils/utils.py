@@ -1,8 +1,12 @@
 import math
 import cv2
 import numpy as np
-from imutils import face_utils
 from scipy.spatial import distance as dist
+
+try:
+    from imutils import face_utils
+except Exception:
+    face_utils = None
 
 # 世界坐标系(UVW)：填写3D参考点
 object_pts = np.float32([[6.825897, 6.760612, 4.402142],  # 33左眉左上角
@@ -49,12 +53,15 @@ line_pairs = [[0, 1], [1, 2], [2, 3], [3, 0],
               [4, 5], [5, 6], [6, 7], [7, 4],
               [0, 4], [1, 5], [2, 6], [3, 7]]
 
-#获取左眼关键点的起始索引和结束索引。
-(lStart, lEnd) = face_utils.FACIAL_LANDMARKS_IDXS["left_eye"]
-#获取右眼关键点的起始索引和结束索引。
-(rStart, rEnd) = face_utils.FACIAL_LANDMARKS_IDXS["right_eye"]
-#获取嘴部关键点的起始索引和结束索引。
-(mStart, mEnd) = face_utils.FACIAL_LANDMARKS_IDXS["mouth"]
+if face_utils is not None:
+    # 获取左眼关键点的起始索引和结束索引。
+    (lStart, lEnd) = face_utils.FACIAL_LANDMARKS_IDXS["left_eye"]
+    # 获取右眼关键点的起始索引和结束索引。
+    (rStart, rEnd) = face_utils.FACIAL_LANDMARKS_IDXS["right_eye"]
+    # 获取嘴部关键点的起始索引和结束索引。
+    (mStart, mEnd) = face_utils.FACIAL_LANDMARKS_IDXS["mouth"]
+else:
+    lStart = lEnd = rStart = rEnd = mStart = mEnd = None
 
 #实现头部姿态估计算法，人脸的关键点信息作为输入
 def get_head_pose(shape):
@@ -108,3 +115,51 @@ def mouth_aspect_ratio(mouth):  # 嘴部
     C = np.linalg.norm(mouth[0] - mouth[6])  # 49, 55
     mar = (A + B) / (2.0 * C)
     return mar
+
+
+def get_head_pose_six_points(image_pts, frame_size):
+    """
+    使用6个2D点（鼻尖、下巴、左右眼角、左右嘴角）估计头部姿态（solvePnP）。
+    image_pts: np.ndarray shape=(6,2) 像素坐标
+    frame_size: (h, w)
+    返回: reprojectdst(8x2), euler_angle(3x1) [pitch,yaw,roll] (degrees)
+    """
+    h, w = frame_size
+    image_pts = np.asarray(image_pts, dtype=np.float32).reshape(-1, 2)
+    if image_pts.shape[0] != 6:
+        raise ValueError("image_pts 必须是6个点")
+
+    # 通用3D人脸模型点（单位：任意，保持相对比例即可）
+    model_pts = np.float32([
+        (0.0, 0.0, 0.0),             # Nose tip
+        (0.0, -330.0, -65.0),        # Chin
+        (-225.0, 170.0, -135.0),     # Left eye left corner
+        (225.0, 170.0, -135.0),      # Right eye right corner
+        (-150.0, -150.0, -125.0),    # Left Mouth corner
+        (150.0, -150.0, -125.0),     # Right mouth corner
+    ])
+
+    # 相机内参（近似）：焦距取图像宽度
+    focal_length = float(w)
+    center = (w / 2.0, h / 2.0)
+    cam_matrix_local = np.array([
+        [focal_length, 0, center[0]],
+        [0, focal_length, center[1]],
+        [0, 0, 1.0],
+    ], dtype=np.float32)
+    dist_coeffs_local = np.zeros((4, 1), dtype=np.float32)
+
+    success, rotation_vec, translation_vec = cv2.solvePnP(
+        model_pts, image_pts, cam_matrix_local, dist_coeffs_local, flags=cv2.SOLVEPNP_ITERATIVE
+    )
+    if not success:
+        raise RuntimeError("solvePnP 失败")
+
+    reprojectdst, _ = cv2.projectPoints(reprojectsrc, rotation_vec, translation_vec, cam_matrix_local, dist_coeffs_local)
+    reprojectdst = tuple(map(tuple, reprojectdst.reshape(8, 2)))
+
+    rotation_mat, _ = cv2.Rodrigues(rotation_vec)
+    pose_mat = cv2.hconcat((rotation_mat, translation_vec))
+    _, _, _, _, _, _, euler_angle = cv2.decomposeProjectionMatrix(pose_mat)
+
+    return reprojectdst, euler_angle

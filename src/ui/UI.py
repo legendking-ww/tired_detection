@@ -16,7 +16,7 @@ class Ui_MainWindow(object):
         MainWindow.setObjectName("MainWindow")
 
         #设置MainWindow对象的大小为1200x800 像素。
-        MainWindow.resize(1200, 800)
+        MainWindow.resize(1280, 840)
         #设置窗口图标
         MainWindow.setWindowIcon(QIcon("resources/images/yjwj.png"))
         
@@ -34,8 +34,8 @@ class Ui_MainWindow(object):
         
         # 创建左侧控制面板
         left_panel = QtWidgets.QWidget()
-        left_panel.setMinimumWidth(300)
-        left_panel.setMaximumWidth(350)
+        left_panel.setMinimumWidth(260)
+        left_panel.setMaximumWidth(340)
         left_layout = QtWidgets.QVBoxLayout(left_panel)
         left_layout.setSpacing(20)
         left_layout.setContentsMargins(20, 20, 20, 20)
@@ -177,33 +177,42 @@ class Ui_MainWindow(object):
         # 添加伸缩空间
         left_layout.addStretch()
         
-        # 创建右侧显示区域
+        # 创建右侧显示区域（可拖动分割：视频区 / 日志区）
         right_panel = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(20, 20, 20, 20)
-        
-        # 创建视频显示区域
-        video_group = QtWidgets.QGroupBox("视频显示")
+        right_layout.setContentsMargins(12, 12, 12, 12)
+
+        video_group = QtWidgets.QGroupBox("检测画面")
         video_group.setFont(QFont("微软雅黑", 10, QFont.Bold))
         video_layout = QtWidgets.QVBoxLayout(video_group)
-        
-        # 创建GraphicsView用于显示视频
+
         self.graphicsView = QtWidgets.QGraphicsView()
-        self.graphicsView.setStyleSheet("QGraphicsView { border: 1px solid #CCCCCC; border-radius: 4px; background-color: #000000; }")
+        self.graphicsView.setMinimumHeight(280)
+        self.graphicsView.setStyleSheet(
+            "QGraphicsView { border: 1px solid #CCCCCC; border-radius: 4px; background-color: #000000; }"
+        )
         video_layout.addWidget(self.graphicsView)
-        right_layout.addWidget(video_group)
-        
-        # 创建输出信息区域
-        output_group = QtWidgets.QGroupBox("系统信息")
+
+        output_group = QtWidgets.QGroupBox("系统信息（可拖动上沿调整高度）")
         output_group.setFont(QFont("微软雅黑", 10, QFont.Bold))
         output_layout = QtWidgets.QVBoxLayout(output_group)
-        
-        # 创建文本浏览器用于显示输出信息
+
         self.output_Window = QtWidgets.QTextBrowser()
         self.output_Window.setFont(QFont("Consolas", 9))
-        self.output_Window.setStyleSheet("QTextBrowser { border: 1px solid #CCCCCC; border-radius: 4px; background-color: #FFFFFF; }")
+        self.output_Window.setMinimumHeight(96)
+        self.output_Window.setStyleSheet(
+            "QTextBrowser { border: 1px solid #CCCCCC; border-radius: 4px; background-color: #FFFFFF; }"
+        )
         output_layout.addWidget(self.output_Window)
-        right_layout.addWidget(output_group)
+
+        right_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        right_splitter.setChildrenCollapsible(False)
+        right_splitter.addWidget(video_group)
+        right_splitter.addWidget(output_group)
+        right_splitter.setStretchFactor(0, 5)
+        right_splitter.setStretchFactor(1, 2)
+        right_splitter.setSizes([560, 200])
+        right_layout.addWidget(right_splitter)
         
         # 将左右面板添加到主布局
         main_layout.addWidget(left_panel)
@@ -221,119 +230,6 @@ class Ui_MainWindow(object):
         self.retranslateUi(MainWindow)
         QtCore.QMetaObject.connectSlotsByName(MainWindow)
 
-    def retranslateUi(self, MainWindow):
-        _translate = QtCore.QCoreApplication.translate
-        MainWindow.setWindowTitle(_translate("MainWindow", "疲劳驾驶检测系统"))
-        self.Button_OpenVideo.setText(_translate("MainWindow", "打开视频文件"))
-        self.Button_Start.setText(_translate("MainWindow", "开始检测"))
-        self.Button_End.setText(_translate("MainWindow", "结束检测"))
-        self.Button_AdjustCamera_Location.setText(_translate("MainWindow", "调整摄像头"))
-        self.offDuty_Check.setText(_translate("MainWindow", "启用脱岗检测"))
-        self.video.setText(_translate("MainWindow", "视频文件"))
-        self.cam.setText(_translate("MainWindow", "摄像头"))
-        self.show_eye.setText(_translate("MainWindow", "显示眼睛"))
-        self.show_mouth.setText(_translate("MainWindow", "显示嘴巴"))
-        self.show_head.setText(_translate("MainWindow", "显示头部姿态"))
-        self.show_key_point.setText(_translate("MainWindow", "显示关键点"))
-        self.statusbar.showMessage(_translate("MainWindow", "就绪"))
-        font.setPointSize(8)
-        self.Button_AdjustCamera_Location.setFont(font)
-        self.Button_AdjustCamera_Location.setObjectName("Button_AdjustCamera_Location")
-
-        #创建widget部件，并将其添加到centralwidget部件中
-        self.widget = QtWidgets.QWidget(self.centralwidget)
-        self.widget.setGeometry(QtCore.QRect(0, 160, 141, 31))
-        self.widget.setObjectName("widget")
-
-        #创建了一个名为 video 的复选框，并将其添加到widget部件中
-        self.video = QtWidgets.QCheckBox(self.widget)
-        self.video.setGeometry(QtCore.QRect(10, 0, 87, 31))
-        font = QtGui.QFont()
-        font.setFamily("黑体")
-        font.setPointSize(10)
-        self.video.setFont(font)
-        self.video.setChecked(False)
-        self.video.setAutoExclusive(True)
-        self.video.setObjectName("video")
-
-        #创建cam复选框
-        self.cam = QtWidgets.QCheckBox(self.widget)
-        self.cam.setGeometry(QtCore.QRect(70, 0, 87, 31))
-        font = QtGui.QFont()
-        font.setFamily("黑体")
-        font.setPointSize(10)
-        self.cam.setFont(font)
-        #设置了 cam 复选框的初始选中状态为选中。
-        self.cam.setChecked(True)
-        #设置了 cam 复选框的自动排他性，即当一个复选框被选中时，其他复选框会自动取消选中。
-        self.cam.setAutoExclusive(True)
-        self.cam.setObjectName("cam")
-
-        #设置show_key_point复选框
-        self.show_key_point = QtWidgets.QCheckBox(self.centralwidget)
-        self.show_key_point.setGeometry(QtCore.QRect(10, 270, 87, 31))
-        font = QtGui.QFont()
-        font.setFamily("黑体")
-        font.setPointSize(10)
-        self.show_key_point.setFont(font)
-        self.show_key_point.setObjectName("show_key_point")
-
-        #设置line_6线
-        self.line_6 = QtWidgets.QFrame(self.centralwidget)
-        self.line_6.setGeometry(QtCore.QRect(80, 250, 201, 16))
-        self.line_6.setFrameShape(QtWidgets.QFrame.HLine)
-        self.line_6.setFrameShadow(QtWidgets.QFrame.Sunken)
-        self.line_6.setObjectName("line_6")
-
-        #设置label_8标签
-        self.label_8 = QtWidgets.QLabel(self.centralwidget)
-        self.label_8.setGeometry(QtCore.QRect(10, 250, 71, 16))
-        font = QtGui.QFont()
-        font.setFamily("黑体")
-        font.setPointSize(10)
-        self.label_8.setFont(font)
-        self.label_8.setObjectName("label_8")
-
-        #创建show_head复选框
-        self.show_head = QtWidgets.QCheckBox(self.centralwidget)
-        self.show_head.setGeometry(QtCore.QRect(220, 270, 61, 31))
-        font = QtGui.QFont()
-        font.setFamily("黑体")
-        font.setPointSize(8)
-        self.show_head.setFont(font)
-        self.show_head.setObjectName("show_head")
-
-        #创建show_eye复选框
-        self.show_eye = QtWidgets.QCheckBox(self.centralwidget)
-        self.show_eye.setGeometry(QtCore.QRect(90, 270, 51, 31))
-        font = QtGui.QFont()
-        font.setFamily("黑体")
-        font.setPointSize(8)
-        self.show_eye.setFont(font)
-        self.show_eye.setObjectName("show_eye")
-        self.show_eye.setChecked(True)
-
-        #创建show_mouth复选框
-        self.show_mouth = QtWidgets.QCheckBox(self.centralwidget)
-        self.show_mouth.setGeometry(QtCore.QRect(160, 270, 51, 31))
-        font = QtGui.QFont()
-        font.setFamily("黑体")
-        font.setPointSize(8)
-        self.show_mouth.setFont(font)
-        self.show_mouth.setObjectName("show_mouth")
-        self.show_mouth.setChecked(True)
-
-        #将 MainWindow 的中心部件设置为 centralwidget。
-        MainWindow.setCentralWidget(self.centralwidget)
-        #为 actionExit 操作对象设置一个唯一对象名称。
-        self.actionExit = QtWidgets.QAction(MainWindow)
-        self.actionExit.setObjectName("actionExit")
-        #调用 retranslateUi 方法为 MainWindow 设置界面的文本。
-        self.retranslateUi(MainWindow)
-        #调用 QtCore.QMetaObject.connectSlotsByName 方法将对象和槽函数进行连接。
-        QtCore.QMetaObject.connectSlotsByName(MainWindow)
-
-    #这段代码是用于设置界面的文本和按钮的显示文字
     def retranslateUi(self, MainWindow):
         #_translate 是一个用于翻译文本的函数，用于为界面的各个元素设置文本
         _translate = QtCore.QCoreApplication.translate

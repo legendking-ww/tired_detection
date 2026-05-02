@@ -12,6 +12,11 @@ class YOLO_face:
         self.num_classes = len(self.class_names)
         # Initialize model
         self.net = cv2.dnn.readNet(path)
+        try:
+            self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+        except Exception:
+            pass
         self.input_height = 640
         self.input_width = 640
         self.reg_max = 16

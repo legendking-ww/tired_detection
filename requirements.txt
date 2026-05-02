@@ -1,0 +1,18 @@
+# 疲劳驾驶检测系统 — Python 依赖（建议 3.9–3.11）
+# 安装: pip install -r requirements.txt
+# PyTorch CUDA 版需单独按官方指引安装（与 numpy<2 对齐），例如:
+#   pip install torch==2.0.0+cu118 torchvision==0.15.0+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
+
+numpy>=1.23,<2
+opencv-contrib-python>=4.8,<4.11
+mediapipe>=0.10.14
+PyQt5>=5.15
+Pillow>=9.0
+pygame>=2.0
+scipy>=1.9
+
+# 深度学习（二选一或按显卡安装 CPU/CUDA 轮子）
+# torch
+# torchvision
+
+# 人脸关键点由 MediaPipe（face_mesh 或 Tasks FaceLandmarker）提供，无需 dlib
