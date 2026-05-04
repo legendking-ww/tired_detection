@@ -1,10 +1,21 @@
--# 基于深度学习的疲劳驾驶
+# 基于深度学习的疲劳驾驶检测（tireddetect）
 
 # tireddetect 项目代码分析与总结
 
 ## 1. 项目概述
 
 tireddetect 是一个基于深度学习的疲劳驾驶检测系统，使用计算机视觉技术实时监测驾驶员的疲劳状态，包括闭眼、打哈欠和低头等行为，并在检测到疲劳时发出警告。系统还集成了人脸识别功能，支持用户注册和身份验证。**人脸关键点**采用 **MediaPipe**（优先 `face_mesh`，否则 **Tasks FaceLandmarker**），已**移除 dlib**；**应用入口**为根目录 `main.py`，**PyQt 界面与检测线程**位于 **`src/app/`**，详见下文「第 8 节」。
+
+### 1.1 技术报告摘要（亮点速览）
+
+| 方向 | 要点 |
+|------|------|
+| **多模态融合** | 可选 **视觉 + 语音**（Whisper 转写 + LLM 0～1 疲劳分）；默认 **加权视觉分**（闭眼/哈欠/低头不同权重）+ **EMA 平滑** + **动态语音权重**（视觉低且语音高时提高语音占比）；`TIRED_FATIGUE_LOGIC=legacy` 可切回旧版 max 融合。 |
+| **预警与统计** | 融合分三级 `normal` / `watch` / `danger`；统计窗口为 **帧数**（`TIRED_STATS_PERIOD_FRAMES`）；危险级强弹窗/音乐带 **冷却**；多模态下危险可要求 **连续多窗** 才累加（`TIRED_DANGER_STREAK_WINDOWS`）。 |
+| **身份与性能** | 检测过程中 **姓名识别**默认仅在前 N 秒抽样 + 多数表决后锁定（`TIRED_FACE_NAME_*`），避免每帧比对；人脸登录/注册用 **QTimer** + 识别/写库节流，主界面不卡。 |
+| **界面与体验** | 主窗口加宽、**语音识别流水**区、登录/注册 **毛玻璃卡片**与高对比输入框；主预览 **复用 QGraphicsScene**、可选 **`TIRED_PREVIEW_MAX_HEIGHT`** 降采样，显著减轻卡顿。 |
+| **工程与依赖** | 摄像头枚举 **静默日志 + 轻探测**（`TIRED_CAMERA_PROBE_MAX`）；EAR 距离计算 **仅用 NumPy**，**已移除 scipy**；`pygame` 仅用于疲劳 **mp3** 提示音。 |
+| **排障工具** | 根目录 **`verify_env.py`** 为可选脚本：检查 `.env` 是否加载、密钥是否「像有值」（不打印完整 Secret），**不参与主程序启动**。 |
 
 ## 2. 项目结构
 
@@ -31,6 +42,7 @@ tireddetect/
 │   ├── sounds/         # 声音资源
 │   └── weights/        # 模型权重文件
 ├── main.py             # 应用入口（启动登录界面）
+├── verify_env.py       # 可选：检查 .env 是否加载（手工运行，主程序不依赖）
 └── mrsoft.db           # 数据库文件
 ```
 
@@ -114,8 +126,8 @@ tireddetect/
 - **面部关键点索引**：定义眼睛、嘴巴等面部区域的关键点索引
 
 **技术亮点**：
-- 提供了多种实用的工具函数
-- 优化了计算效率
+- 提供了多种实用的工具函数（EAR/MAR、头部姿态、绘制用 `line_pairs` 等）
+- **EAR 欧氏距离仅用 NumPy**，无 scipy 依赖
 - 支持多种面部特征的提取和分析
 
 ## 4. 技术栈
@@ -127,12 +139,12 @@ tireddetect/
 | OpenCV | 图像处理和视频捕获 |
 | MediaPipe | 人脸关键点检测（face_mesh / FaceLandmarker） |
 | imutils | 图像处理辅助工具 |
-| NumPy | 数值计算 |
-| PyTorch | 深度学习框架 |
-| SciPy | 科学计算 |
+| NumPy | 数值计算；EAR 等欧氏距离均在 `utils.py` 内用 numpy 实现 |
+| PyTorch | 深度学习框架（FaceNet 等人脸特征，可选） |
 | SQLite | 数据库存储 |
-| Pygame | 声音播放 |
-| PIL | 图像处理，支持中文显示 |
+| Pygame | 疲劳强告警时播放 `resources/sounds/warning.mp3` |
+| PIL | 图像处理，支持中文叠字 |
+| requests / python-dotenv | 多模态 HTTP 与 `.env` 加载 |
 
 ## 5. 核心功能实现
 
@@ -180,23 +192,26 @@ tireddetect/
 
 ### 6.1 性能优化
 
-- **图像处理优化**：减小图像处理尺寸，提高处理速度
-- **人脸检测优化**：使用 YOLO 模型，提高检测速度和准确性
-- **线程管理优化**：使用多线程，避免 UI 卡顿
-- **数据库操作优化**：实现线程安全的数据库操作
+- **检测线程**：疲劳循环在 **`QThread`** 中运行，不阻塞 Qt 主事件循环。
+- **主界面预览**：`MainWindow.show_Image` **复用** `QGraphicsScene` / `QGraphicsPixmapItem`，仅更新 `QPixmap`，避免每帧重建场景与全量 `fitInView`；窗口缩放时在 `resizeEvent` 中再适配。
+- **预览分辨率**：环境变量 **`TIRED_PREVIEW_MAX_HEIGHT`**（默认 `900`，`0` 关闭）对大图降采样后再上屏，减轻 CPU/GPU 与 Qt 绘制压力。
+- **摄像头枚举**：`init_camera_list` 使用 **`verify_frame=False` + `grab()`** 轻探测，并对 OpenCV 日志 **静默**，减少无效 index 导致的卡顿与刷屏（`TIRED_CAMERA_PROBE_MAX` 控制探测个数）。
+- **姓名识别**：检测开始后仅在 **探测窗口**内按帧抽样做人脸比对，表决锁定后 **不再调用** `recognize_face`（见 `TIRED_FACE_NAME_*`）。
+- **依赖瘦身**：已移除 **scipy**，EAR 相关欧氏距离统一为 **NumPy** 实现。
 
 ### 6.2 功能改进
 
-- **中文显示支持**：使用 PIL 库实现中文显示
-- **多用户支持**：支持多个用户的注册和识别
-- **同框多人识别**：支持同时识别画面中的多个人脸
-- **用户友好界面**：提供直观的可视化界面
+- **多模态疲劳**：视觉统计窗 + 语音周期分析；融合策略可 **`weighted`（默认）** 与 **`legacy`** 切换（见第 8.9 节与 `TIRED_FATIGUE_LOGIC`）。
+- **中文显示支持**：使用 PIL 库实现中文显示（登录/注册预览、主画面叠字）。
+- **多用户支持**：支持多个用户的注册和识别。
+- **登录/注册 UI**：毛玻璃半透明卡片、高对比输入框；人脸登录/人脸注册采用 **QTimer** 驱动，识别与写库 **节流**。
+- **主界面**：加宽布局、多模态状态区、**语音识别流水**时间线、系统日志分栏；左侧无整栏滚动条，减少视觉干扰。
 
 ### 6.3 可靠性改进
 
 - **异常处理**：完善异常处理，提高系统稳定性
 - **错误提示**：提供清晰的错误信息和提示
-- **资源管理**：确保资源的正确释放
+- **资源管理**：确保资源的正确释放（如登录窗关闭时释放摄像头与定时器）
 - **路径处理**：实现灵活的路径处理，提高兼容性
 
 ## 7. 应用场景
@@ -224,10 +239,14 @@ tireddetect/
 
 - **MediaPipe**：优先 `face_mesh`，否则 Tasks；Tasks 路径含整图增强/翻转重试，ROI 短边过小时**内部放大再检测**并映射回原图；置信度适度放宽以利弱光召回。  
 - **移除 dlib**：不再使用 `shape_predictor_68_face_landmarks.dat` 等；关键点与裁剪由 MediaPipe 承担。  
-- **摄像头（Windows）**：`src/utils/cv_helpers.open_video_capture_by_index` — **MSMF 优先**，再 DSHOW，且 **`read()` 成功** 才算可用。  
+- **摄像头（Windows）**：`src/utils/cv_helpers.open_video_capture_by_index` — **MSMF 优先**，再 DSHOW；枚举时 **`grab()`** 轻量验证，**探测期静默 OpenCV 日志**，主线程枚举用 **`verify_frame=False`** 降低阻塞。  
 - **中文叠字**：登录/注册预览用 **`draw_text_cn_on_bgr`（PIL）**，避免 `cv2.putText` 中文变问号。  
-- **工程结构**：`main.py` 仅入口；`src/app/` 承载线程与窗口；`src/utils/cv_helpers.py` 承载摄像头与叠字。  
-- **代码注释**：`fatigue_detection.py` 顶部说明 **468/478、连接表、IMAGE/detect** 等，避免与旧版 `FACEMESH_*` 混用。
+- **工程结构**：`main.py` 仅入口；`src/app/` 承载线程与窗口；`src/utils/cv_helpers.py` 承载摄像头与叠字；**`src/multimodal/`** 承载语音与融合。  
+- **代码注释**：`fatigue_detection.py` 顶部说明 **468/478、连接表、IMAGE/detect** 等，避免与旧版 `FACEMESH_*` 混用。  
+- **多模态融合 2.0（默认 `weighted`）**：视觉分由 **闭眼/哈欠/低头** 按饱和比例加权（非简单 max）+ **EMA 平滑**；与语音融合时若「视觉低且语音高」则 **提高语音权重**；等级阈值默认 **注意 0.30 / 危险 0.65**（均可用环境变量覆盖）。  
+- **主界面流畅度**：预览 **Scene 复用**、**按需 fitInView**、**GraphicsView 优化标志**；可选预览限高 **`TIRED_PREVIEW_MAX_HEIGHT`**。  
+- **认证界面**：登录/注册 **半透明玻璃卡片**、高对比输入框；人脸登录与 **人脸注册** 均为 **QTimer** 单帧 tick，避免主线程 `while` 卡死。  
+- **依赖**：已去除 **scipy**（EAR 欧氏距离改 NumPy）；**`verify_env.py`** 为可选环境自检脚本。
 
 ### 8.3 典型问题 — 根因 — 对策
 
@@ -279,7 +298,18 @@ tireddetect/
 
 ### 8.9 多模态（视觉 + 语音，可选 Groq）
 
-在环境变量中开启后，后台线程按 `TIRED_MULTIMODAL_INTERVAL` 周期工作：**文件模式**下读取固定 WAV；**麦克风模式**（`TIRED_MULTIMODAL_MIC=1`）下用 PyQt5 `QAudioInput` 在独立 `QThread` 内录制 `TIRED_MULTIMODAL_RECORD_SEC` 秒，再调用 **Groq**（或 `GROQ_API_BASE` 指向的兼容网关）Whisper 转写 + 聊天模型得到 **0～1 语音疲劳分**。API 多次失败时语音侧记为 **-1**，融合时**仅使用视觉分**。主检测线程在每 **60 帧**统计窗口内加权融合，叠字 `fused` 与等级，并按 `danger` / `watch` 参与预警。
+在环境变量中开启后，后台线程按 `TIRED_MULTIMODAL_INTERVAL` 周期工作：**文件模式**下读取固定 WAV；**麦克风模式**（`TIRED_MULTIMODAL_MIC=1`）下用 PyQt5 `QAudioInput` 在独立 `QThread` 内录制 `TIRED_MULTIMODAL_RECORD_SEC` 秒，再调用 **Groq**（或 `GROQ_API_BASE` 指向的兼容网关）Whisper 转写 + 聊天模型得到 **0～1 语音疲劳分**。API 多次失败时语音侧记为 **-1**，融合时**仅使用视觉分**。主检测线程在 **`TIRED_STATS_PERIOD_FRAMES` 帧**（默认约 5s@30fps，非固定 60 帧）统计窗口末计算视觉分，与最近语音分融合，叠字 `fused` 与等级，并按 `danger` / `watch` 参与预警。
+
+**融合策略（`TIRED_FATIGUE_LOGIC`，默认 `weighted`）**
+
+| 模式 | 说明 |
+|------|------|
+| **`weighted`（推荐）** | 闭眼/哈欠/低头按 **`TIRED_VISUAL_SAT_*`** 饱和比例得到分量，再按 **`TIRED_VISUAL_W_*`** 加权求和（非 max）；结果经 **`TIRED_VISUAL_SMOOTH` EMA**；与语音 **`fuse_visual_audio_dynamic`**（视觉低且语音高时提高语音权重）。 |
+| **`legacy`** | 原 **max(三通道)** + 固定 **`TIRED_MULTIMODAL_W_VISUAL` / `W_AUDIO`** 加权，便于与旧数据或论文对比。 |
+
+**默认等级阈值**（均可被 `.env` 覆盖）：**注意** `TIRED_ALERT_WATCH=0.30`，**危险** `TIRED_ALERT_DANGER=0.65`。日志中文案在 `weighted` 下与融合分档对齐（轻微 / 中度 / 极度疲劳等节流提示）。
+
+**其它常用变量（融合与视觉）**：`TIRED_FUSION_BOOST_VISUAL_LT`、`TIRED_FUSION_BOOST_AUDIO_GT`、`TIRED_FUSION_W_AUDIO_BOOST`、`TIRED_DANGER_STREAK_WINDOWS`、`TIRED_VISUAL_SAT_EYE` / `YAWN` / `HEAD`、`TIRED_VISUAL_W_EYE` / `YAWN` / `HEAD`、`TIRED_VISUAL_SMOOTH`。
 
 | 变量 | 说明 |
 |------|------|
@@ -297,7 +327,16 @@ tireddetect/
 | `TIRED_MULTIMODAL_W_VISUAL` / `TIRED_MULTIMODAL_W_AUDIO` | 融合权重，默认 `0.7` / `0.3` |
 | `TIRED_STATS_PERIOD_FRAMES` | 视觉疲劳统计窗口长度（**帧数**，非秒），默认 `150`（约 5s@30fps）；过小会导致日志/蜂鸣很密，可调 `180`–`300` |
 | `TIRED_STRONG_ALERT_COOLDOWN_SEC` | **危险级**弹窗+音乐的冷却（秒），默认 `45`；冷却内仅打日志，避免连续模态框轰炸 |
-| `TIRED_ALERT_WATCH` / `TIRED_ALERT_DANGER` | 多模态融合分阈值：注意级 / 危险级，默认 `0.45` / `0.72`（可按答辩演示调敏钝） |
+| `TIRED_ALERT_WATCH` / `TIRED_ALERT_DANGER` | 多模态融合分阈值：注意级 / 危险级，默认 **`0.30` / `0.65`**（可按答辩演示调敏钝） |
+| `TIRED_ALERT_WATCH_MID` | 注意档内区分「轻微 / 中度」文案用，默认 `0.45` |
+| `TIRED_FATIGUE_LOGIC` | `weighted`（默认）或 `legacy` / `max` / `old` / `0` |
+| `TIRED_FACE_NAME_PROBE_SEC` | 检测中姓名识别：默认前 **12s** 抽样表决后锁定；`0` 关闭叠字；`-1` 每帧比对（重） |
+| `TIRED_FACE_NAME_SAMPLE_FRAMES` | 探测期内每隔多少帧做一次比对，默认 `4` |
+| `TIRED_FACE_LOGIN_RECOGNIZE_SEC` | 人脸登录节流识别间隔（秒），默认 `0.4` |
+| `TIRED_FACE_REGISTER_DB_SEC` | 人脸注册写库节流（秒），默认 `0.5` |
+| `TIRED_FACE_REGISTER_TIMEOUT_SEC` | 人脸注册最长尝试（秒），默认 `180` |
+| `TIRED_CAMERA_PROBE_MAX` | 主窗口枚举摄像头最大 index 个数，默认 `3` |
+| `TIRED_PREVIEW_MAX_HEIGHT` | 主界面预览最大高度（像素），超过则缩小再上屏；默认 `900`，`0` 关闭 |
 | `TIRED_MIC_MIN_RMS` | 麦克风 RMS 参考下限（16bit），默认 `280`；低于此仅提示「音量偏低」，**仍会转写** |
 | `TIRED_MIC_RMS_SILENT_ABORT` | RMS 低于此值视为无效静音、本段不上传，默认 `12`；环境安静仍被误杀可调为 `6`–`8` |
 
@@ -307,7 +346,7 @@ tireddetect/
 
 **安全**：密钥只放在本机环境变量或已被 `.gitignore` 忽略的 `.env` 中，**不要**提交到 Git、不要发到聊天/论坛；若已泄露，请立刻在厂商控制台**作废并换新 Key**。
 
-**方法：`.env` 文件（推荐）**：安装依赖后，将仓库中的 `.env.example` 复制为项目根目录下的 `.env` 并填写密钥；`main.py` 在启动时会执行 `load_dotenv()` 加载（需 `pip install python-dotenv`，已写入 `requirements.txt`）。`.env` 已被 `.gitignore` 忽略。
+**方法：`.env` 文件（推荐）**：安装依赖后在项目根目录创建 `.env` 并填写密钥；`main.py` 在启动时会执行 `load_dotenv()` 加载（需 `pip install python-dotenv`，已写入 `requirements.txt`）。`.env` 已被 `.gitignore` 忽略。可选运行 **`python verify_env.py`** 检查 `.env` 是否被正确加载（不打印完整密钥）。
 
 **SiliconFlow + Qwen 示例**（与 Groq 二选一；密钥用占位符，请换成本地变量）：
 
@@ -323,14 +362,14 @@ $env:GROQ_CHAT_MODEL="Qwen/Qwen3-8B"
 
 ## 9. 项目亮点
 
-1. **多模态疲劳检测**：综合考虑眼睛、嘴巴和头部姿态三个维度的信息，提高检测准确性
-2. **自适应阈值**：通过前100帧的数据分析，自动计算适合当前用户的疲劳检测阈值
-3. **深度学习应用**：使用 YOLO 和 Inception-ResNet 等深度学习模型，提高人脸检测和识别的准确性
-4. **用户友好界面**：提供直观的可视化界面，操作简单方便
-5. **模块化设计**：代码结构清晰，模块化程度高，便于维护和扩展
-6. **多用户支持**：支持多个用户的注册和识别，适合团队使用
-7. **中文显示**：支持中文姓名的显示，提高用户体验
-8. **安全性**：实现了账号密码和人脸识别双重认证，提高系统安全性
+1. **多模态疲劳（可选）**：视觉统计与 **Whisper + LLM 语音疲劳分** 融合；默认 **加权视觉 + EMA 平滑 + 动态语音权重**，缓解「仅低头拉高 max」「语音拉不动」等问题；**`legacy` 一键回退**便于对比实验。  
+2. **自适应视觉阈值**：前 **100 帧**标定 EAR/MAR/俯仰，得到个人化阈值，再进入滑窗比例统计。  
+3. **分级与节流预警**：融合 **`normal` / `watch` / `danger`**；强弹窗/音乐 **冷却**；可选 **连续多窗危险** 才叠加强告警，减少偶发抖动误报。  
+4. **身份识别省算力**：检测全程 **不再每帧做人脸比对**；默认前若干秒 **抽样 + 多数表决** 锁定姓名（可关可恢复旧行为）。  
+5. **界面与信息架构**：主窗口加宽、**语音流水时间线**、多模态状态与系统日志分区；登录/注册 **毛玻璃半透明** + 高对比表单；人脸登录/注册 **异步帧驱动**，避免界面假死。  
+6. **运行流畅度**：预览 **Scene 复用**、按需 **`fitInView`**、可选 **预览限高**；摄像头枚举 **轻量 + 静默日志**；**移除 scipy**，依赖更轻。  
+7. **深度学习与关键点**：可选 **YOLO** 人脸框；**MediaPipe** `face_mesh` 或 **Tasks FaceLandmarker**；**FaceNet** 特征与 SQLite 多用户管理。  
+8. **中文与工程化**：PIL 中文叠字；`.env` + **utf-8-sig** 防 BOM；**`verify_env.py`** 可选自检；`src/multimodal` 与 **ffmpeg 视频伴音** 可扩展。
 
 ## 10. 总结
 
