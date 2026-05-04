@@ -1,4 +1,4 @@
-# 基于深度学习的疲劳驾驶
+-# 基于深度学习的疲劳驾驶
 
 # tireddetect 项目代码分析与总结
 
@@ -265,6 +265,7 @@ tireddetect/
 | 关键点双后端与注释 | `src/core/fatigue_detection.py` |
 | 应用入口 | `main.py` |
 | 疲劳/调参线程 | `src/app/worker_threads.py` |
+| 多模态融合、Groq、麦克风录制 | `src/multimodal/`（含 `mic_qt.py`） |
 | 主检测窗口 | `src/app/main_window.py` |
 | 登录/注册/人脸采集 | `src/app/auth_windows.py` |
 | 摄像头与中文叠字 | `src/utils/cv_helpers.py` |
@@ -275,6 +276,50 @@ tireddetect/
 2. **人脸识别准确性**：受光线、姿态影响 → 深度学习特征 + 阈值与采集质量优化。  
 3. **实时性**：多线程 + 合理缩小处理分辨率。  
 4. **多用户**：SQLite 存储用户与人脸特征。
+
+### 8.9 多模态（视觉 + 语音，可选 Groq）
+
+在环境变量中开启后，后台线程按 `TIRED_MULTIMODAL_INTERVAL` 周期工作：**文件模式**下读取固定 WAV；**麦克风模式**（`TIRED_MULTIMODAL_MIC=1`）下用 PyQt5 `QAudioInput` 在独立 `QThread` 内录制 `TIRED_MULTIMODAL_RECORD_SEC` 秒，再调用 **Groq**（或 `GROQ_API_BASE` 指向的兼容网关）Whisper 转写 + 聊天模型得到 **0～1 语音疲劳分**。API 多次失败时语音侧记为 **-1**，融合时**仅使用视觉分**。主检测线程在每 **60 帧**统计窗口内加权融合，叠字 `fused` 与等级，并按 `danger` / `watch` 参与预警。
+
+| 变量 | 说明 |
+|------|------|
+| `TIRED_MULTIMODAL` | 设为 `1` / `true` 开启 |
+| `TIRED_MULTIMODAL_MIC` | 设为 `1` 使用麦克风；不设则读 WAV 文件（向后兼容） |
+| `TIRED_MULTIMODAL_VIDEO_AUDIO` | 设为 `1` 且正在**播放视频文件**时，用 **ffmpeg** 从视频当前进度附近抽音轨做语音分析（需安装 ffmpeg）；优先级高于麦克风 |
+| `TIRED_MULTIMODAL_RECORD_SEC` | 单次麦克风录制秒数，默认 `10` |
+| `SILICONFLOW_API_KEY` | 硅基流动等：与下两项任填其一（见 `groq_api_key()` 读取顺序） |
+| `MULTIMODAL_API_KEY` | 任意兼容厂商 Bearer Token |
+| `GROQ_API_KEY` | 名称保留以兼容旧说明（[Groq](https://console.groq.com/) 等） |
+| `GROQ_API_BASE` | OpenAI 兼容 API 根 URL，默认 `https://api.groq.com/openai/v1`（可填代理或 SiliconFlow 等） |
+| `GROQ_WHISPER_MODEL` / `GROQ_CHAT_MODEL` | 转写 / 聊天模型名，默认 `whisper-large-v3`、`llama-3.1-8b-instant` |
+| `TIRED_MULTIMODAL_WAV` | 文件模式下的 wav；不设则尝试 `resources/samples/driver_demo.wav` |
+| `TIRED_MULTIMODAL_INTERVAL` | 周期间隔（秒），默认 `10`；麦克风模式下实际间隔 ≈「录制 + API」后补睡到该值 |
+| `TIRED_MULTIMODAL_W_VISUAL` / `TIRED_MULTIMODAL_W_AUDIO` | 融合权重，默认 `0.7` / `0.3` |
+| `TIRED_STATS_PERIOD_FRAMES` | 视觉疲劳统计窗口长度（**帧数**，非秒），默认 `150`（约 5s@30fps）；过小会导致日志/蜂鸣很密，可调 `180`–`300` |
+| `TIRED_STRONG_ALERT_COOLDOWN_SEC` | **危险级**弹窗+音乐的冷却（秒），默认 `45`；冷却内仅打日志，避免连续模态框轰炸 |
+| `TIRED_ALERT_WATCH` / `TIRED_ALERT_DANGER` | 多模态融合分阈值：注意级 / 危险级，默认 `0.45` / `0.72`（可按答辩演示调敏钝） |
+| `TIRED_MIC_MIN_RMS` | 麦克风 RMS 参考下限（16bit），默认 `280`；低于此仅提示「音量偏低」，**仍会转写** |
+| `TIRED_MIC_RMS_SILENT_ABORT` | RMS 低于此值视为无效静音、本段不上传，默认 `12`；环境安静仍被误杀可调为 `6`–`8` |
+
+**分级预警（多模态 fused）**：`normal`（绿字）仅画面提示；`watch`（橙字）节流日志 + 短促高频蜂鸣（与轻视觉告警共用节流）；`danger`（红字）参与累加并尽快触发 **危险级**弹窗与 `warning.mp3`。强弹窗/音乐受 `TIRED_STRONG_ALERT_COOLDOWN_SEC` 限制，冷却内只发文字提醒。
+
+国内网络可配置 `GROQ_API_BASE` 指向可达的兼容网关；HTTP 对 429/5xx 与网络错误有有限次退避重试（见 `src/multimodal/groq_audio.py`）。
+
+**安全**：密钥只放在本机环境变量或已被 `.gitignore` 忽略的 `.env` 中，**不要**提交到 Git、不要发到聊天/论坛；若已泄露，请立刻在厂商控制台**作废并换新 Key**。
+
+**方法：`.env` 文件（推荐）**：安装依赖后，将仓库中的 `.env.example` 复制为项目根目录下的 `.env` 并填写密钥；`main.py` 在启动时会执行 `load_dotenv()` 加载（需 `pip install python-dotenv`，已写入 `requirements.txt`）。`.env` 已被 `.gitignore` 忽略。
+
+**SiliconFlow + Qwen 示例**（与 Groq 二选一；密钥用占位符，请换成本地变量）：
+
+```powershell
+$env:TIRED_MULTIMODAL="1"
+$env:GROQ_API_BASE="https://api.siliconflow.com/v1"
+$env:MULTIMODAL_API_KEY="你的_sk_密钥"
+$env:GROQ_WHISPER_MODEL="FunAudioLLM/SenseVoiceSmall"
+$env:GROQ_CHAT_MODEL="Qwen/Qwen3-8B"
+```
+
+若国内解析 `api.siliconflow.com` 较慢，可尝试控制台文档中的 `https://api.siliconflow.cn/v1`。转写请求对 **Groq** 会自动带 `response_format=json`，对 **其它 Base** 则不带，以兼容 SiliconFlow 等网关。
 
 ## 9. 项目亮点
 

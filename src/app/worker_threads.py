@@ -1,5 +1,9 @@
 """疲劳检测与摄像头调整线程。"""
+from __future__ import annotations
+
+import os
 import time
+from collections import Counter
 import cv2
 import winsound
 from pygame import mixer
@@ -7,6 +11,16 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 from src.core.fatigue_detection import FatigueDetector
 from src.core.face_recognition import FaceRecognition
+from src.multimodal.audio_loop import start_audio_loop, stop_audio_loop
+from src.multimodal.config import (
+    groq_api_key,
+    is_multimodal_enabled,
+    is_multimodal_mic,
+    is_multimodal_video_audio,
+)
+from src.multimodal import video_audio_ctx
+from src.multimodal.fusion import alert_level, fuse_visual_audio, fuse_visual_audio_dynamic
+from src.multimodal.state import clear_fusion_display, get_last_audio_score, get_last_transcript, set_last_fusion
 from src.utils.cv_helpers import draw_text_cn_on_bgr, open_video_capture_by_index
 
 
@@ -99,6 +113,23 @@ class Start_Thread(BaseThread):
         self.isShowMouth = True
         self.isShowHead = False
         self.isShowKeyPoint = False
+        self._mm_last_audio_err = None
+        self._log_throttle = {}
+        self._last_warn_beep = 0.0
+        self._last_strong_fatigue_alert = 0.0
+
+    def _emit_msg_throttled(self, key, message, min_interval_sec=22.0):
+        """同一 key 的提示在 min_interval_sec 内最多发一次，减轻日志与弹窗骚扰。"""
+        now = time.monotonic()
+        if now - self._log_throttle.get(key, 0.0) >= min_interval_sec:
+            self._log_throttle[key] = now
+            self.msg.emit(message)
+
+    def _beep_warn_throttled(self, min_interval_sec=14.0, duration_ms=380, freq=440):
+        now = time.monotonic()
+        if now - self._last_warn_beep >= min_interval_sec:
+            self._last_warn_beep = now
+            winsound.Beep(freq, duration_ms)
 
     def set_show_eye(self, isShowEye):
         self.isShowEye = isShowEye
@@ -167,7 +198,10 @@ class Start_Thread(BaseThread):
             mar_sum = 0
             har_sum = 0
 
-            Detected_TIME_LIMIT = 60
+            # 统计窗口为「帧数」不是秒：原 60 帧在 30fps 下仅约 2s，告警会非常密。默认改为 150 帧（约 5s@30fps），可用环境变量调节。
+            stats_period_frames = max(45, int(os.environ.get("TIRED_STATS_PERIOD_FRAMES", "150")))
+            strong_alert_cd = max(10.0, float(os.environ.get("TIRED_STRONG_ALERT_COOLDOWN_SEC", "45")))
+            Detected_TIME_LIMIT = stats_period_frames
             closed_times = 0
             yawning_times = 0
             pitch_times = 0
@@ -182,6 +216,24 @@ class Start_Thread(BaseThread):
             off_duty_last_alert = 0.0
             calib_miss_streak = 0
             CALIB_MISS_ABORT = 300
+
+            # 姓名：默认前若干秒抽样做人脸比对，多数表决后锁定，之后不再调用 recognize_face（省算力）
+            # TIRED_FACE_NAME_PROBE_SEC：>0 为探测秒数；0 关闭叠字姓名；<0（如 -1）每帧比对（旧行为，开销大）
+            _probe_raw = os.environ.get("TIRED_FACE_NAME_PROBE_SEC", "12").strip()
+            try:
+                face_name_probe_sec = float(_probe_raw) if _probe_raw else 12.0
+            except ValueError:
+                face_name_probe_sec = 12.0
+            face_name_sample_every = max(1, int(os.environ.get("TIRED_FACE_NAME_SAMPLE_FRAMES", "4")))
+            face_session_t0 = time.monotonic()
+            face_name_hits: list[str] = []
+            face_name_locked: str | None = None
+            face_name_finalized = False
+            face_name_frame_tick = 0
+            face_name_last_hit: str | None = None
+
+            smooth_visual = 0.0
+            danger_streak_mm = 0
 
             self.msg.emit("程序正在加载中，请您耐心等待")
             self.window.emit("程序正在加载中，请您耐心等待")
@@ -204,8 +256,49 @@ class Start_Thread(BaseThread):
                 else:
                     self.msg.emit("摄像头预热完成，请正对镜头、面部光线均匀（勿强逆光）")
 
+            if is_multimodal_enabled():
+                clear_fusion_display()
+                start_audio_loop()
+                has_key = bool(groq_api_key())
+                if is_multimodal_video_audio() and has_key:
+                    self.msg.emit(
+                        "多模态：已启用「视频伴音」模式（播放视频文件时从音轨抽音频，需本机安装 ffmpeg 并在 PATH 中）。"
+                        "未播放视频时将回退麦克风或 WAV。"
+                    )
+                if is_multimodal_mic():
+                    if has_key:
+                        self.msg.emit(
+                            "多模态已开启（麦克风）：按 TIRED_MULTIMODAL_RECORD_SEC 录制，"
+                            "TIRED_MULTIMODAL_INTERVAL 控制分析周期；已读取 API 密钥，语音疲劳分析将自动进行。"
+                        )
+                    else:
+                        self.msg.emit(
+                            "多模态已开启（麦克风）：未检测到 API 密钥。请在项目根目录 .env 中设置 "
+                            "SILICONFLOW_API_KEY（或 MULTIMODAL_API_KEY / GROQ_API_KEY）与 GROQ_API_BASE 后重启程序。"
+                        )
+                else:
+                    if has_key:
+                        self.msg.emit(
+                            "多模态已开启（文件）：按 TIRED_MULTIMODAL_INTERVAL 轮询 WAV；已读取 API 密钥。"
+                            "请确认 TIRED_MULTIMODAL_WAV 或 resources/samples/driver_demo.wav 存在。"
+                        )
+                    else:
+                        self.msg.emit(
+                            "多模态已开启（文件）：未检测到 API 密钥。请在 .env 中配置密钥与 GROQ_API_BASE；"
+                            "并设置 TIRED_MULTIMODAL_WAV 或放置 resources/samples/driver_demo.wav。"
+                        )
+
             while True:
                 ret, raw = self.cap.read()
+                if is_multimodal_enabled():
+                    if ret and self.isOpenVideo and self.filePath:
+                        try:
+                            pos = float(self.cap.get(cv2.CAP_PROP_POS_MSEC))
+                        except Exception:
+                            pos = 0.0
+                        video_audio_ctx.set_playback(self.filePath, pos)
+                    else:
+                        video_audio_ctx.set_playback("", 0.0)
                 if not ret:
                     if self.isOpenVideo:
                         self.window.emit("视频播放结束")
@@ -288,9 +381,46 @@ class Start_Thread(BaseThread):
                 bottom = rect.bottom()
                 face_img = frame[top:bottom, left:right]
                 if face_img.size > 0:
-                    name = self.face_recognition.recognize_face(face_img)
-                    if name:
-                        frame = draw_text_cn_on_bgr(frame, f"姓名: {name}", (left, top - 25), font_size=16, color=(0, 255, 255))
+                    display_name = None
+                    if face_name_probe_sec < 0:
+                        display_name = self.face_recognition.recognize_face(face_img)
+                    elif face_name_probe_sec == 0:
+                        display_name = None
+                    else:
+                        elapsed = time.monotonic() - face_session_t0
+                        if not face_name_finalized:
+                            if elapsed <= face_name_probe_sec:
+                                face_name_frame_tick += 1
+                                if face_name_frame_tick % face_name_sample_every == 0:
+                                    got = self.face_recognition.recognize_face(face_img)
+                                    if got:
+                                        face_name_hits.append(got)
+                                        face_name_last_hit = got
+                                display_name = face_name_last_hit
+                            else:
+                                face_name_finalized = True
+                                if face_name_hits:
+                                    face_name_locked = Counter(face_name_hits).most_common(1)[0][0]
+                                    self.msg.emit(
+                                        f"已锁定姓名：{face_name_locked}（前 {face_name_probe_sec:.0f} 秒内多数表决），"
+                                        f"后续已关闭人脸比对以减轻负载。"
+                                    )
+                                else:
+                                    self.msg.emit(
+                                        f"前 {face_name_probe_sec:.0f} 秒未匹配到注册人脸，本段检测不叠示姓名。"
+                                    )
+                                display_name = face_name_locked
+                        else:
+                            display_name = face_name_locked
+
+                    if display_name:
+                        frame = draw_text_cn_on_bgr(
+                            frame,
+                            f"姓名: {display_name}",
+                            (left, top - 25),
+                            font_size=16,
+                            color=(0, 255, 255),
+                        )
 
                 cv2.putText(frame, "ear: {:.2f}".format(ear), (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 cv2.putText(frame, "mar: {:.2f}".format(mar), (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
@@ -344,30 +474,169 @@ class Start_Thread(BaseThread):
                         pitch_times += 1
 
                 else:
-                    period_len = 60
+                    period_len = stats_period_frames
                     Detected_TIME_LIMIT = period_len
                     isEyeTired = False
                     isYawnTired = False
                     isHeadTired = False
 
                     if closed_times / period_len > FATIGUE_THRESH:
-                        self.msg.emit("闭眼时长较长")
                         isEyeTired = True
 
                     if yawning_times / period_len > FATIGUE_THRESH:
-                        self.msg.emit("张嘴时长较长")
                         isYawnTired = True
 
                     if pitch_times / period_len > FATIGUE_THRESH:
-                        self.msg.emit("低头时长较长")
                         isHeadTired = True
+
+                    weighted_mm_msgs = False
+                    if is_multimodal_enabled():
+                        from src.multimodal import config as mm_cfg
+
+                        logic = mm_cfg.fatigue_logic_mode()
+                        weighted_mm_msgs = logic == "weighted"
+                        if logic == "legacy":
+                            thr = max(float(FATIGUE_THRESH), 1e-6)
+                            v_eye = min(1.0, (closed_times / float(period_len)) / (2.0 * thr))
+                            v_yawn = min(1.0, (yawning_times / float(period_len)) / (2.0 * thr))
+                            v_head = min(1.0, (pitch_times / float(period_len)) / (2.0 * thr))
+                            visual_score = max(v_eye, v_yawn, v_head)
+                            visual_for_fusion = visual_score
+                        else:
+                            re = closed_times / float(period_len)
+                            ry = yawning_times / float(period_len)
+                            rh = pitch_times / float(period_len)
+                            sat_e = mm_cfg.visual_sat_eye()
+                            sat_y = mm_cfg.visual_sat_yawn()
+                            sat_h = mm_cfg.visual_sat_head()
+                            v_eye = min(1.0, re / sat_e)
+                            v_yawn = min(1.0, ry / sat_y)
+                            v_head = min(1.0, rh / sat_h)
+                            we, wy, wh = (
+                                mm_cfg.visual_w_eye(),
+                                mm_cfg.visual_w_yawn(),
+                                mm_cfg.visual_w_head(),
+                            )
+                            sw = we + wy + wh
+                            if sw <= 1e-6:
+                                visual_score = 0.0
+                            else:
+                                visual_score = (we * v_eye + wy * v_yawn + wh * v_head) / sw
+                            alpha = mm_cfg.visual_smooth_alpha()
+                            smooth_visual = alpha * visual_score + (1.0 - alpha) * smooth_visual
+                            smooth_visual = max(0.0, min(1.0, smooth_visual))
+                            visual_for_fusion = smooth_visual
+
+                        audio_s, audio_err = get_last_audio_score()
+                        if (
+                            audio_err
+                            and (audio_s is None or audio_s < 0)
+                            and self._mm_last_audio_err != audio_err
+                        ):
+                            self._mm_last_audio_err = audio_err
+                            self.msg.emit(f"语音疲劳分析：{audio_err}")
+                        if audio_s is not None and audio_s >= 0 and audio_err is None:
+                            self._mm_last_audio_err = None
+                        if audio_s is None or audio_s < 0:
+                            fused = visual_for_fusion
+                        elif logic == "legacy":
+                            fused = fuse_visual_audio(
+                                visual_for_fusion,
+                                float(audio_s),
+                                mm_cfg.visual_weight(),
+                                mm_cfg.audio_weight(),
+                            )
+                        else:
+                            fused = fuse_visual_audio_dynamic(visual_for_fusion, float(audio_s))
+
+                        lvl = alert_level(fused)
+                        set_last_fusion(visual_for_fusion, fused, lvl)
+                        lvl_cn = {"danger": "危险", "watch": "注意", "normal": "正常"}.get(lvl, lvl)
+                        if lvl == "danger":
+                            mm_color = (40, 40, 255)
+                        elif lvl == "watch":
+                            mm_color = (0, 180, 255)
+                        else:
+                            mm_color = (60, 200, 80)
+                        aud_txt = f"{float(audio_s):.2f}" if audio_s is not None and audio_s >= 0 else "--"
+                        vis_label = "视觉" if logic == "legacy" else "视觉(平滑)"
+                        frame = self.put_text_cn(
+                            frame,
+                            f"【多模态】融合 {fused:.2f}  {vis_label}{visual_for_fusion:.2f}  语音{aud_txt}  [{lvl_cn}]",
+                            (10, 95),
+                            font_size=20,
+                            color=mm_color,
+                        )
+                        tx = get_last_transcript()
+                        if tx:
+                            preview = tx[:56] + ("…" if len(tx) > 56 else "")
+                            frame = self.put_text_cn(
+                                frame,
+                                f"转写：{preview}",
+                                (10, frame.shape[0] - 48),
+                                font_size=16,
+                                color=(0, 255, 255),
+                            )
+
+                        w_thr = mm_cfg.alert_watch_threshold()
+                        d_thr = mm_cfg.alert_danger_threshold()
+                        mid_thr = mm_cfg.alert_watch_mid()
+
+                        if logic == "weighted":
+                            if fused >= d_thr:
+                                self._emit_msg_throttled(
+                                    "fused_danger",
+                                    "【融合】极度疲劳，请立即休息！",
+                                    22.0,
+                                )
+                            elif fused >= mid_thr:
+                                self._emit_msg_throttled(
+                                    "fused_watch_hi",
+                                    "【融合】中度疲劳，建议休息。",
+                                    26.0,
+                                )
+                            elif fused >= w_thr:
+                                self._emit_msg_throttled(
+                                    "fused_watch_lo",
+                                    "【融合】轻微疲劳，请注意。",
+                                    30.0,
+                                )
+                            streak_need = mm_cfg.danger_streak_windows()
+                            if lvl == "danger":
+                                danger_streak_mm += 1
+                            else:
+                                danger_streak_mm = 0
+                            if lvl == "danger" and danger_streak_mm >= streak_need:
+                                warning_time += 2
+                            elif lvl == "watch":
+                                self._beep_warn_throttled(min_interval_sec=35.0, duration_ms=220, freq=880)
+                        else:
+                            if lvl == "danger":
+                                warning_time += 2
+                            elif lvl == "watch":
+                                self._emit_msg_throttled(
+                                    "mm_watch",
+                                    "【注意级】多模态综合分数偏高，建议稍作休息（仅日志与画面提示，无强弹窗）。",
+                                    40.0,
+                                )
+                                self._beep_warn_throttled(min_interval_sec=35.0, duration_ms=220, freq=880)
+
+                    if not weighted_mm_msgs:
+                        if isEyeTired:
+                            self._emit_msg_throttled("eye_long", "闭眼时长较长", 22.0)
+                        if isYawnTired:
+                            self._emit_msg_throttled("yawn_long", "张嘴时长较长", 22.0)
+                        if isHeadTired:
+                            self._emit_msg_throttled("head_low", "低头时长较长", 22.0)
 
                     closed_times = 0
                     yawning_times = 0
                     pitch_times = 0
 
                     isWarning = False
-                    if isEyeTired and isYawnTired:
+                    if weighted_mm_msgs:
+                        pass
+                    elif isEyeTired and isYawnTired:
                         warning_time += 2
                         isWarning = True
                     elif isHeadTired and isEyeTired:
@@ -387,12 +656,19 @@ class Start_Thread(BaseThread):
 
                     if warning_time >= 3:
                         warning_time = 0
-                        self.msg.emit("您已经疲劳，请注意休息!")
-                        self.window.emit("您已经疲劳，请注意休息!")
-                        self.playMusic()
+                        now_alert = time.monotonic()
+                        if now_alert - self._last_strong_fatigue_alert >= strong_alert_cd:
+                            self._last_strong_fatigue_alert = now_alert
+                            self.msg.emit("【危险级】您已经疲劳，请注意休息!")
+                            self.window.emit("您已经疲劳，请注意休息!")
+                            self.playMusic()
+                        else:
+                            self.msg.emit(
+                                "【危险级】疲劳信号持续偏高（强弹窗与提示音冷却中，请主动休息）。"
+                            )
                     else:
                         if isWarning:
-                            winsound.Beep(440, 1000)
+                            self._beep_warn_throttled()
 
                 self.picture.emit(frame)
 
@@ -403,5 +679,9 @@ class Start_Thread(BaseThread):
             print(error_msg)
             self.msg.emit(error_msg)
         finally:
+            if is_multimodal_enabled():
+                video_audio_ctx.clear_playback()
+                stop_audio_loop()
+                clear_fusion_display()
             if self.cap is not None:
                 self.cap.release()

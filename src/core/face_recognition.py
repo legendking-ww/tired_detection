@@ -270,35 +270,41 @@ class FaceRecognition:
             # 获取数据库中的所有人脸特征
             face_data = self.get_all_face_features()
             if not face_data:
-                print("数据库中没有人脸数据")
+                if os.environ.get("TIRED_FACE_RECO_DEBUG") == "1":
+                    print("数据库中没有人脸数据")
                 return None
             
             # 计算相似度
             min_dist = float('inf')
             best_match = None
-            
-            print(f"数据库中有 {len(face_data)} 个人脸数据")
+            _dbg = os.environ.get("TIRED_FACE_RECO_DEBUG") == "1"
+            if _dbg:
+                print(f"数据库中有 {len(face_data)} 个人脸数据")
             for face_id, name, db_feat in face_data:
-                print(f"比较人脸: {name}")
+                if _dbg:
+                    print(f"比较人脸: {name}")
                 try:
                     db_vec = self._l2_normalize(self._flatten_embedding(db_feat))
                     dist = float(np.linalg.norm(current_feat - db_vec))
-                    print(f"距离: {dist}")
+                    if _dbg:
+                        print(f"距离: {dist}")
                     if dist < min_dist:
                         min_dist = dist
                         best_match = name
                 except Exception as e:
-                    print(f"计算距离失败: {e}")
+                    if _dbg:
+                        print(f"计算距离失败: {e}")
                     continue
             
-            # 设置阈值，只有当距离小于阈值时才认为匹配成功
-            print(f"最小距离: {min_dist}")
+            if _dbg:
+                print(f"最小距离: {min_dist}")
             if min_dist < self.match_thresh:
-                print(f"识别成功: {best_match}")
+                if _dbg:
+                    print(f"识别成功: {best_match}")
                 return best_match
-            else:
+            if _dbg:
                 print("识别失败: 距离超过阈值")
-                return None
+            return None
         except Exception as e:
             print(f"人脸识别失败: {e}")
             return None

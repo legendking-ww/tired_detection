@@ -1,6 +1,7 @@
 """OpenCV 辅助：摄像头多后端打开、BGR 图像中文叠字（PIL）。"""
 import os
 import sys
+from contextlib import contextmanager
 
 import cv2
 import numpy as np
@@ -10,12 +11,41 @@ from PIL import Image, ImageDraw, ImageFont
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
-def open_video_capture_by_index(index: int):
+@contextmanager
+def _cv2_log_silent():
+    """探测无效摄像头索引时抑制 OpenCV 刷屏（MSMF/DSHOW/obsensor 等），避免界面卡顿感。"""
+    prev = None
+    try:
+        prev = cv2.getLogLevel()
+    except Exception:
+        pass
+    silent = getattr(cv2, "LOG_LEVEL_SILENT", 0)
+    try:
+        cv2.setLogLevel(silent)
+    except Exception:
+        try:
+            cv2.setLogLevel(0)
+        except Exception:
+            pass
+    try:
+        yield
+    finally:
+        if prev is not None:
+            try:
+                cv2.setLogLevel(prev)
+            except Exception:
+                pass
+
+
+def open_video_capture_by_index(index: int, *, verify_frame: bool = True):
     """
     打开指定序号的摄像头。Windows 上部分环境 DirectShow(DSHOW) 会报
     VIDEOIO(DSHOW): ... can't be used to capture by index 且无法出图，
     与画面是否镜像无关。Windows 上优先 MSMF，再试 DSHOW（部分机器上 DSHOW
     会对某些 index 打印 VIDEOIO(DSHOW)... can't be used to capture 且无法出图）。
+
+    verify_frame：为 True 时用 read 确认能出图（检测线程等）；为 False 时仅用 grab
+    做轻量探测（主窗口枚举设备），失败路径更快、少阻塞。
     """
     backends = []
     if sys.platform == "win32":
@@ -25,21 +55,29 @@ def open_video_capture_by_index(index: int):
             backends.append(cv2.CAP_DSHOW)
     backends.append(None)
 
-    for api in backends:
-        cap = cv2.VideoCapture(index) if api is None else cv2.VideoCapture(index, api)
-        if not cap.isOpened():
+    with _cv2_log_silent():
+        for api in backends:
+            cap = cv2.VideoCapture(index) if api is None else cv2.VideoCapture(index, api)
+            if not cap.isOpened():
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                continue
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+            if verify_frame:
+                ret, _ = cap.read()
+            else:
+                ret = cap.grab()
+            if ret:
+                return cap
             try:
                 cap.release()
             except Exception:
                 pass
-            continue
-        ret, _ = cap.read()
-        if ret:
-            return cap
-        try:
-            cap.release()
-        except Exception:
-            pass
     return None
 
 

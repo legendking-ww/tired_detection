@@ -1,7 +1,6 @@
 import math
 import cv2
 import numpy as np
-from scipy.spatial import distance as dist
 
 try:
     from imutils import face_utils
@@ -94,14 +93,19 @@ def get_head_pose(shape):
 
     return reprojectdst, euler_angle  # 投影误差，欧拉角
 
+def _euclidean_2d(p, q) -> float:
+    """两点欧氏距离（仅用 numpy，避免依赖 scipy）。"""
+    return float(np.linalg.norm(np.asarray(p, dtype=np.float64) - np.asarray(q, dtype=np.float64)))
+
+
 #用于计算眼睛的长宽比
 def eye_aspect_ratio(eye):
     # 垂直眼标志（X，Y）坐标
-    A = dist.euclidean(eye[1], eye[5])
-    B = dist.euclidean(eye[2], eye[4])
+    A = _euclidean_2d(eye[1], eye[5])
+    B = _euclidean_2d(eye[2], eye[4])
     # 计算水平之间的欧几里得距离
     # 水平眼标志（X，Y）坐标
-    C = dist.euclidean(eye[0], eye[3])
+    C = _euclidean_2d(eye[0], eye[3])
     # 眼睛长宽比的计算
     ear = (A + B) / (2.0 * C)
     # 返回眼睛的长宽比
