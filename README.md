@@ -1,6 +1,4 @@
-# 基于深度学习的疲劳驾驶检测（tireddetect）
-
-# tireddetect 项目代码分析与总结
+# 基于深度学习的多模态疲劳驾驶检测（tireddetect）
 
 ## 1. 项目概述
 
