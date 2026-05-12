@@ -12,15 +12,26 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from src.core.fatigue_detection import FatigueDetector
 from src.core.face_recognition import FaceRecognition
 from src.multimodal.audio_loop import start_audio_loop, stop_audio_loop
+from src.multimodal.agent_runner import schedule_llm_fatigue_agent
+from src.multimodal import config as mm_cfg_static
 from src.multimodal.config import (
     groq_api_key,
+    is_agent_local_tts_enabled,
+    is_llm_agent_enabled,
     is_multimodal_enabled,
     is_multimodal_mic,
     is_multimodal_video_audio,
+    llm_agent_cooldown_sec,
 )
 from src.multimodal import video_audio_ctx
 from src.multimodal.fusion import alert_level, fuse_visual_audio, fuse_visual_audio_dynamic
-from src.multimodal.state import clear_fusion_display, get_last_audio_score, get_last_transcript, set_last_fusion
+from src.multimodal.state import (
+    clear_fusion_display,
+    get_last_audio_score,
+    get_last_fusion,
+    get_last_transcript,
+    set_last_fusion,
+)
 from src.utils.cv_helpers import draw_text_cn_on_bgr, open_video_capture_by_index
 
 
@@ -37,17 +48,32 @@ class BaseThread(QThread):
         self.cap = None
         self.camSelect = 0
         self.isClose = False
+        # UI 预览节流：主线程跨线程收图过密会排队卡顿。0 表示每帧都发；默认约 30fps。
+        try:
+            _ms = os.environ.get("TIRED_UI_PREVIEW_MIN_MS", "33").strip()
+            self._ui_preview_interval = max(0.0, float(_ms or "0") / 1000.0)
+        except ValueError:
+            self._ui_preview_interval = 0.033
+        self._last_picture_emit_time = 0.0
+
+    def emit_picture_if_due(self, frame) -> None:
+        """按 TIRED_UI_PREVIEW_MIN_MS 节流送预览帧；检测线程仍每帧跑算法。"""
+        if frame is None:
+            return
+        if self._ui_preview_interval <= 0:
+            self.picture.emit(frame)
+            return
+        t = time.monotonic()
+        if t - self._last_picture_emit_time >= self._ui_preview_interval:
+            self._last_picture_emit_time = t
+            self.picture.emit(frame)
 
     def change_cam_select(self, camSelect):
         self.camSelect = camSelect
 
     def close(self):
+        """仅请求线程退出；不要在 UI 线程里 release VideoCapture，避免与 worker 的 read() 竞态。"""
         self.isClose = True
-        if self.cap is not None:
-            try:
-                self.cap.release()
-            except Exception as e:
-                pass
 
     def process_frame(self, frame):
         return self.fatigue_detector.process_frame(frame)
@@ -88,7 +114,7 @@ class AdjustCamera_Thread(BaseThread):
                     cv2.putText(frame, "yaw: {:5.2f}".format(yaw), (180, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
                     cv2.putText(frame, "roll: {:5.2f}".format(roll), (350, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-                self.picture.emit(frame)
+                self.emit_picture_if_due(frame)
                 
                 if self.isClose:
                     break
@@ -98,7 +124,11 @@ class AdjustCamera_Thread(BaseThread):
             self.msg.emit(error_msg)
         finally:
             if self.cap is not None:
-                self.cap.release()
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                self.cap = None
             self.window.emit("摄像头位置调整结束")
 
 class Start_Thread(BaseThread):
@@ -117,6 +147,7 @@ class Start_Thread(BaseThread):
         self._log_throttle = {}
         self._last_warn_beep = 0.0
         self._last_strong_fatigue_alert = 0.0
+        self._last_llm_agent_run = 0.0
 
     def _emit_msg_throttled(self, key, message, min_interval_sec=22.0):
         """同一 key 的提示在 min_interval_sec 内最多发一次，减轻日志与弹窗骚扰。"""
@@ -158,9 +189,12 @@ class Start_Thread(BaseThread):
 
     @staticmethod
     def playMusic():
-        mixer.init()
-        mixer.music.load('resources/sounds/warning.mp3')
-        mixer.music.play()
+        try:
+            mixer.init()
+            mixer.music.load("resources/sounds/warning.mp3")
+            mixer.music.play()
+        except Exception as e:
+            print(f"提示音播放失败（可检查 resources/sounds/warning.mp3 与音频设备）: {e}")
     
     @staticmethod
     def put_text_cn(img, text, position, font_size=20, color=(0, 255, 255)):
@@ -199,8 +233,14 @@ class Start_Thread(BaseThread):
             har_sum = 0
 
             # 统计窗口为「帧数」不是秒：原 60 帧在 30fps 下仅约 2s，告警会非常密。默认改为 150 帧（约 5s@30fps），可用环境变量调节。
-            stats_period_frames = max(45, int(os.environ.get("TIRED_STATS_PERIOD_FRAMES", "150")))
-            strong_alert_cd = max(10.0, float(os.environ.get("TIRED_STRONG_ALERT_COOLDOWN_SEC", "45")))
+            try:
+                stats_period_frames = max(45, int(os.environ.get("TIRED_STATS_PERIOD_FRAMES", "150").strip() or "150"))
+            except ValueError:
+                stats_period_frames = 150
+            try:
+                strong_alert_cd = max(10.0, float(os.environ.get("TIRED_STRONG_ALERT_COOLDOWN_SEC", "45").strip() or "45"))
+            except ValueError:
+                strong_alert_cd = 45.0
             Detected_TIME_LIMIT = stats_period_frames
             closed_times = 0
             yawning_times = 0
@@ -348,7 +388,7 @@ class Start_Thread(BaseThread):
                             "是否有效、摄像头分辨率与光线是否充足。"
                         )
                         self.window.emit("未稳定检出人脸：请调整姿势与光线（详见日志区说明）")
-                    self.picture.emit(frame)
+                    self.emit_picture_if_due(frame)
                     if self.isClose:
                         break
                     continue
@@ -375,11 +415,16 @@ class Start_Thread(BaseThread):
                         end_point = (int(reprojectdst[end][0]), int(reprojectdst[end][1]))
                         cv2.line(frame, start_point, end_point, (0, 0, 255), 2)
 
-                left = rect.left()
-                top = rect.top()
-                right = rect.right()
-                bottom = rect.bottom()
-                face_img = frame[top:bottom, left:right]
+                left = int(rect.left())
+                top = int(rect.top())
+                right = int(rect.right())
+                bottom = int(rect.bottom())
+                fh, fw = frame.shape[:2]
+                left_c = max(0, min(left, fw - 1))
+                right_c = max(left_c + 1, min(right, fw))
+                top_c = max(0, min(top, fh - 1))
+                bottom_c = max(top_c + 1, min(bottom, fh))
+                face_img = frame[top_c:bottom_c, left_c:right_c]
                 if face_img.size > 0:
                     display_name = None
                     if face_name_probe_sec < 0:
@@ -445,20 +490,25 @@ class Start_Thread(BaseThread):
                         self.msg.emit('嘴部长宽比mar 100次取平均的阈值:{:.2f}'.format(MAR_THRESH))
                         self.msg.emit('头部俯仰角pitch 100次取平均的阈值:{:.2f}'.format(HAR_THRESH))
                     cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 3)
-                    self.picture.emit(frame)
+                    self.emit_picture_if_due(frame)
                     if self.isClose:
                         break
                     continue
 
+                n_lm = int(lm_px.shape[0])
                 if self.isShowEye:
                     eye_pts_idx = [33, 133, 159, 145, 263, 362, 386, 374]
                     for idx in eye_pts_idx:
+                        if idx >= n_lm:
+                            break
                         x, y = int(lm_px[idx, 0]), int(lm_px[idx, 1])
                         cv2.circle(frame, (x, y), 2, (0, 255, 0), -1)
 
                 if self.isShowMouth:
                     mouth_pts_idx = [61, 291, 13, 14]
                     for idx in mouth_pts_idx:
+                        if idx >= n_lm:
+                            break
                         x, y = int(lm_px[idx, 0]), int(lm_px[idx, 1])
                         cv2.circle(frame, (x, y), 2, (0, 255, 0), -1)
 
@@ -662,6 +712,38 @@ class Start_Thread(BaseThread):
                             self.msg.emit("【危险级】您已经疲劳，请注意休息!")
                             self.window.emit("您已经疲劳，请注意休息!")
                             self.playMusic()
+                            if is_llm_agent_enabled() and groq_api_key():
+                                cd_agent = llm_agent_cooldown_sec()
+                                if now_alert - self._last_llm_agent_run >= cd_agent:
+                                    self._last_llm_agent_run = now_alert
+                                    vis_g, fus_g, lvl_g = get_last_fusion()
+                                    aud_g, aerr_g = get_last_audio_score()
+                                    ctx = {
+                                        "trigger": "strong_fatigue_popup",
+                                        "fused_score": fus_g,
+                                        "visual_score": vis_g,
+                                        "alert_level": lvl_g or "",
+                                        "alert_watch": mm_cfg_static.alert_watch_threshold(),
+                                        "alert_danger": mm_cfg_static.alert_danger_threshold(),
+                                        "fatigue_logic": mm_cfg_static.fatigue_logic_mode(),
+                                        "danger_streak_windows": mm_cfg_static.danger_streak_windows(),
+                                        "audio_score": aud_g,
+                                        "audio_analysis_error": aerr_g,
+                                        "transcript_snippet": (get_last_transcript() or "")[:600],
+                                        "visual_flags": {
+                                            "eye_tired_window": isEyeTired,
+                                            "yawn_tired_window": isYawnTired,
+                                            "head_tired_window": isHeadTired,
+                                        },
+                                        "multimodal_enabled": is_multimodal_enabled(),
+                                        "multimodal_mic": is_multimodal_mic(),
+                                        "agent_local_tts": is_agent_local_tts_enabled(),
+                                    }
+                                    self.msg.emit(
+                                        "[Agent] 已排队：强疲劳告警后将异步请求 LLM；"
+                                        "侧栏多模态区橙色「主动安全 Agent」条与右侧流水会更新。"
+                                    )
+                                    schedule_llm_fatigue_agent(ctx, self.msg.emit)
                         else:
                             self.msg.emit(
                                 "【危险级】疲劳信号持续偏高（强弹窗与提示音冷却中，请主动休息）。"
@@ -670,7 +752,7 @@ class Start_Thread(BaseThread):
                         if isWarning:
                             self._beep_warn_throttled()
 
-                self.picture.emit(frame)
+                self.emit_picture_if_due(frame)
 
                 if self.isClose:
                     break
@@ -680,8 +762,21 @@ class Start_Thread(BaseThread):
             self.msg.emit(error_msg)
         finally:
             if is_multimodal_enabled():
-                video_audio_ctx.clear_playback()
-                stop_audio_loop()
-                clear_fusion_display()
+                try:
+                    video_audio_ctx.clear_playback()
+                except Exception:
+                    pass
+                try:
+                    stop_audio_loop()
+                except Exception:
+                    pass
+                try:
+                    clear_fusion_display()
+                except Exception:
+                    pass
             if self.cap is not None:
-                self.cap.release()
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                self.cap = None

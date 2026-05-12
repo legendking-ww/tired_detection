@@ -165,3 +165,38 @@ def mic_min_rms() -> float:
 def mic_rms_silent_abort() -> float:
     """RMS 低于此值视为接近数字静音，放弃本段上传（默认 12）。环境极安静可调低到 6~8。"""
     return float(os.environ.get("TIRED_MIC_RMS_SILENT_ABORT", "12"))
+
+
+def is_llm_agent_enabled() -> bool:
+    """为真时在强疲劳告警触发后异步调用 LLM 生成 JSON 行动计划并执行（TTS / 地图等）。"""
+    return os.environ.get("TIRED_LLM_AGENT", "").strip().lower() in ("1", "true", "yes")
+
+
+def llm_agent_cooldown_sec() -> float:
+    """两次 Agent 调用之间的最小间隔（秒）。"""
+    return max(30.0, float(os.environ.get("TIRED_AGENT_COOLDOWN_SEC", "120")))
+
+
+def llm_agent_timeout() -> float:
+    """Agent Chat 请求超时（秒）。"""
+    return max(8.0, float(os.environ.get("TIRED_AGENT_TIMEOUT", "40")))
+
+
+def llm_agent_max_tokens() -> int:
+    return max(128, min(1024, int(os.environ.get("TIRED_AGENT_MAX_TOKENS", "512"))))
+
+
+def llm_agent_chat_model() -> str:
+    """留空则与 GROQ_CHAT_MODEL 相同。"""
+    m = os.environ.get("TIRED_AGENT_CHAT_MODEL", "").strip()
+    return m if m else groq_chat_model()
+
+
+def is_agent_local_tts_enabled() -> bool:
+    """为假时不执行本地 speak（不调用 pyttsx3）；LLM、打开地图、日志仍可用。环境变量 TIRED_AGENT_LOCAL_TTS=0 关闭。"""
+    return os.environ.get("TIRED_AGENT_LOCAL_TTS", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )

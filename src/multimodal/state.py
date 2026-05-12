@@ -12,6 +12,8 @@ _last_transcript: str = ""
 _last_visual: Optional[float] = None
 _last_fused: Optional[float] = None
 _last_level: str = ""
+_agent_status: str = ""
+_agent_summary: str = ""
 
 
 def set_last_audio_score(value: Optional[float], err: Optional[str] = None) -> None:
@@ -68,11 +70,43 @@ def get_last_fusion() -> Tuple[Optional[float], Optional[float], str]:
         return _last_visual, _last_fused, _last_level
 
 
+def set_agent_status(text: str) -> None:
+    """供 Agent 线程写入一行状态，主界面定时刷新显示。"""
+    global _agent_status
+    t = (text or "").strip().replace("\n", " ")
+    if len(t) > 420:
+        t = t[:417] + "…"
+    with _lock:
+        _agent_status = t
+
+
+def get_agent_status() -> str:
+    with _lock:
+        return _agent_status
+
+
+def set_agent_summary(text: str) -> None:
+    """最近一次 Agent 运行结束后的多行文本（推理 + 执行摘要），供侧栏固定展示。"""
+    global _agent_summary
+    t = (text or "").strip()
+    if len(t) > 900:
+        t = t[:897] + "…"
+    with _lock:
+        _agent_summary = t
+
+
+def get_agent_summary() -> str:
+    with _lock:
+        return _agent_summary
+
+
 def clear_fusion_display() -> None:
-    global _last_transcript, _last_visual, _last_fused, _last_level, _voice_log
+    global _last_transcript, _last_visual, _last_fused, _last_level, _voice_log, _agent_status, _agent_summary
     with _lock:
         _last_transcript = ""
         _last_visual = None
         _last_fused = None
         _last_level = ""
         _voice_log.clear()
+        _agent_status = ""
+        _agent_summary = ""
