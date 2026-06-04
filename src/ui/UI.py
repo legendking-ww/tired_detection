@@ -25,7 +25,8 @@ class Ui_MainWindow(object):
         #给这个实例命了个名字（唯一标识符）。方便类外界访问。
         MainWindow.setObjectName("MainWindow")
 
-        MainWindow.resize(1920, 1040)
+        # 初始大小：根据屏幕自适应（由 MainWindow._apply_responsive_size 在 showEvent 中设定）
+        MainWindow.setMinimumSize(1024, 680)
         #设置窗口图标
         MainWindow.setWindowIcon(QIcon("resources/images/yjwj.png"))
         

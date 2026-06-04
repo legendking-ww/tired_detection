@@ -33,6 +33,10 @@ from src.multimodal.state import (
     set_last_fusion,
 )
 from src.utils.cv_helpers import draw_text_cn_on_bgr, open_video_capture_by_index
+from src.utils.history import DetectionHistory
+from src.utils.logger import get_logger
+
+_log = get_logger(__name__)
 
 
 class BaseThread(QThread):
@@ -48,32 +52,31 @@ class BaseThread(QThread):
         self.cap = None
         self.camSelect = 0
         self.isClose = False
-        # UI 预览节流：主线程跨线程收图过密会排队卡顿。0 表示每帧都发；默认约 30fps。
-        try:
-            _ms = os.environ.get("TIRED_UI_PREVIEW_MIN_MS", "33").strip()
-            self._ui_preview_interval = max(0.0, float(_ms or "0") / 1000.0)
-        except ValueError:
-            self._ui_preview_interval = 0.033
-        self._last_picture_emit_time = 0.0
-
-    def emit_picture_if_due(self, frame) -> None:
-        """按 TIRED_UI_PREVIEW_MIN_MS 节流送预览帧；检测线程仍每帧跑算法。"""
-        if frame is None:
-            return
-        if self._ui_preview_interval <= 0:
-            self.picture.emit(frame)
-            return
-        t = time.monotonic()
-        if t - self._last_picture_emit_time >= self._ui_preview_interval:
-            self._last_picture_emit_time = t
-            self.picture.emit(frame)
 
     def change_cam_select(self, camSelect):
         self.camSelect = camSelect
 
     def close(self):
-        """仅请求线程退出；不要在 UI 线程里 release VideoCapture，避免与 worker 的 read() 竞态。"""
         self.isClose = True
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+
+    def stop(self, timeout_ms: int = 3000):
+        """优雅停止：置关闭标志 → 释放摄像头 → 等待线程结束（超时强制终止）。"""
+        self.isClose = True
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+        if self.isRunning():
+            if not self.wait(timeout_ms):
+                _log.warning("Thread %s did not finish within %dms, terminating", self.__class__.__name__, timeout_ms)
+                self.terminate()
+                self.wait(1000)
 
     def process_frame(self, frame):
         return self.fatigue_detector.process_frame(frame)
@@ -114,21 +117,17 @@ class AdjustCamera_Thread(BaseThread):
                     cv2.putText(frame, "yaw: {:5.2f}".format(yaw), (180, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
                     cv2.putText(frame, "roll: {:5.2f}".format(roll), (350, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-                self.emit_picture_if_due(frame)
+                self.picture.emit(frame)
                 
                 if self.isClose:
                     break
         except Exception as e:
             error_msg = f"摄像头调整失败: {str(e)}"
-            print(error_msg)
+            _log.error(error_msg)
             self.msg.emit(error_msg)
         finally:
             if self.cap is not None:
-                try:
-                    self.cap.release()
-                except Exception:
-                    pass
-                self.cap = None
+                self.cap.release()
             self.window.emit("摄像头位置调整结束")
 
 class Start_Thread(BaseThread):
@@ -148,6 +147,17 @@ class Start_Thread(BaseThread):
         self._last_warn_beep = 0.0
         self._last_strong_fatigue_alert = 0.0
         self._last_llm_agent_run = 0.0
+        self._cam_consec_fail = 0
+        self._frame_idx_global = 0
+        # 推理分级：根据疲劳等级动态跳帧
+        self._inference_skip = 0  # 0=每帧, 1=隔1帧, 2=隔2帧
+        self._inference_skip_counter = 0
+        self._approx_fps = 30.0
+        self._fps_update_time = time.monotonic()
+        self._fps_frame_count = 0
+        # 历史数据记录句柄
+        self._history_writer: DetectionHistory | None = None
+        self._last_analysis = None
 
     def _emit_msg_throttled(self, key, message, min_interval_sec=22.0):
         """同一 key 的提示在 min_interval_sec 内最多发一次，减轻日志与弹窗骚扰。"""
@@ -189,13 +199,25 @@ class Start_Thread(BaseThread):
 
     @staticmethod
     def playMusic():
-        try:
-            mixer.init()
-            mixer.music.load("resources/sounds/warning.mp3")
-            mixer.music.play()
-        except Exception as e:
-            print(f"提示音播放失败（可检查 resources/sounds/warning.mp3 与音频设备）: {e}")
-    
+        mixer.init()
+        mixer.music.load('resources/sounds/warning.mp3')
+        mixer.music.play()
+
+    def _update_inference_tier(self, fused_score: float | None, alert_lvl: str) -> None:
+        """根据疲劳等级动态调整推理跳帧策略。"""
+        min_fps = max(5, min(30, int(os.environ.get("TIRED_INFERENCE_MIN_FPS", "10"))))
+        if alert_lvl == "danger":
+            self._inference_skip = 0  # 危险：每帧推理
+        elif alert_lvl == "watch":
+            self._inference_skip = max(0, int(30.0 / max(1, min_fps * 1.5)) - 1)  # 注意：适度跳帧
+        elif fused_score is not None and fused_score >= 0.15:
+            self._inference_skip = max(0, int(30.0 / max(1, min_fps)) - 1)  # 轻微：跳一些帧
+        else:
+            self._inference_skip = max(0, int(30.0 / max(1, min_fps * 0.75)) - 1)  # 正常：最多跳帧
+        # 人脸丢失时强制全帧
+        if self._last_analysis is None:
+            self._inference_skip = 0
+
     @staticmethod
     def put_text_cn(img, text, position, font_size=20, color=(0, 255, 255)):
         return draw_text_cn_on_bgr(img, text, position, font_size=font_size, color=color)
@@ -233,18 +255,13 @@ class Start_Thread(BaseThread):
             har_sum = 0
 
             # 统计窗口为「帧数」不是秒：原 60 帧在 30fps 下仅约 2s，告警会非常密。默认改为 150 帧（约 5s@30fps），可用环境变量调节。
-            try:
-                stats_period_frames = max(45, int(os.environ.get("TIRED_STATS_PERIOD_FRAMES", "150").strip() or "150"))
-            except ValueError:
-                stats_period_frames = 150
-            try:
-                strong_alert_cd = max(10.0, float(os.environ.get("TIRED_STRONG_ALERT_COOLDOWN_SEC", "45").strip() or "45"))
-            except ValueError:
-                strong_alert_cd = 45.0
+            stats_period_frames = max(45, int(os.environ.get("TIRED_STATS_PERIOD_FRAMES", "150")))
+            strong_alert_cd = max(10.0, float(os.environ.get("TIRED_STRONG_ALERT_COOLDOWN_SEC", "45")))
             Detected_TIME_LIMIT = stats_period_frames
             closed_times = 0
             yawning_times = 0
             pitch_times = 0
+            perclos_high_frames = 0
             warning_time = 0
 
             EAR_THRESH = 0.32
@@ -296,6 +313,16 @@ class Start_Thread(BaseThread):
                 else:
                     self.msg.emit("摄像头预热完成，请正对镜头、面部光线均匀（勿强逆光）")
 
+            # ---- 历史数据记录 ----
+            try:
+                self._history_writer = DetectionHistory("mrsoft.db")
+                self._history_writer.init_tables()
+                self._history_writer.start_session()
+                _log.info("检测历史记录已启动")
+            except Exception as e:
+                _log.warning("历史记录初始化失败（不影响检测）: %s", e)
+                self._history_writer = None
+
             if is_multimodal_enabled():
                 clear_fusion_display()
                 start_audio_loop()
@@ -342,11 +369,64 @@ class Start_Thread(BaseThread):
                 if not ret:
                     if self.isOpenVideo:
                         self.window.emit("视频播放结束")
-                    print('视频结束')
-                    break
+                        _log.info("视频播放结束")
+                        break
+                    # 摄像头断连：尝试指数退避重连
+                    self._cam_consec_fail += 1
+                    max_retry = max(1, min(10, int(os.environ.get("TIRED_CAM_RECONNECT_MAX", "5"))))
+                    if self._cam_consec_fail > max_retry:
+                        _log.error("摄像头连续 %d 次读取失败，已达最大重试次数，退出检测", max_retry)
+                        self.window.emit(f"摄像头连续{max_retry}次断连，已放弃重连。请检查设备后重新开始。")
+                        break
+                    backoff = min(8.0, 2 ** (self._cam_consec_fail - 1))
+                    self.msg.emit(f"摄像头断开，正在重连 ({self._cam_consec_fail}/{max_retry})…")
+                    _log.warning("摄像头读帧失败 (连续%d次)，%0.1fs 后重连…", self._cam_consec_fail, backoff)
+                    try:
+                        self.cap.release()
+                    except Exception:
+                        pass
+                    # 退避等待中分段检查 isClose，避免阻塞退出
+                    for _t in range(int(backoff * 5)):
+                        time.sleep(0.2)
+                        if self.isClose:
+                            break
+                    if self.isClose:
+                        break
+                    self.cap = open_video_capture_by_index(self.camSelect)
+                    if self.cap is not None:
+                        try:
+                            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                        except Exception:
+                            pass
+                        self._cam_consec_fail = 0
+                        _log.info("摄像头已重连成功")
+                        self.msg.emit("摄像头已重连，继续检测。")
+                    else:
+                        _log.warning("摄像头重连失败，将再试…")
+                    continue
+
+                # ---- 帧率估算 ----
+                self._fps_frame_count += 1
+                now_fps = time.monotonic()
+                if now_fps - self._fps_update_time >= 2.0:
+                    self._approx_fps = self._fps_frame_count / max(0.1, now_fps - self._fps_update_time)
+                    self._fps_frame_count = 0
+                    self._fps_update_time = now_fps
 
                 frame, gray, _ = self.process_frame(raw)
-                analysis = self.fatigue_detector.analyze_face(frame)
+
+                # ---- 推理分级：根据疲劳等级动态跳帧（跳过 MediaPipe / FaceNet 等重推理）----
+                self._frame_idx_global += 1
+                if test_time >= TEST_TIMES and self._inference_skip > 0:
+                    self._inference_skip_counter += 1
+                    if self._inference_skip_counter % (self._inference_skip + 1) != 0:
+                        analysis = self._last_analysis
+                    else:
+                        analysis = self.fatigue_detector.analyze_face(frame)
+                        self._last_analysis = analysis
+                else:
+                    analysis = self.fatigue_detector.analyze_face(frame)
+                    self._last_analysis = analysis
                 if analysis is None:
                     raw_n = self.fatigue_detector._normalize_bgr(raw)
                     ar = self.fatigue_detector.analyze_face(raw_n)
@@ -388,7 +468,7 @@ class Start_Thread(BaseThread):
                             "是否有效、摄像头分辨率与光线是否充足。"
                         )
                         self.window.emit("未稳定检出人脸：请调整姿势与光线（详见日志区说明）")
-                    self.emit_picture_if_due(frame)
+                    self.picture.emit(frame)
                     if self.isClose:
                         break
                     continue
@@ -404,6 +484,10 @@ class Start_Thread(BaseThread):
                 roll = analysis["roll"]
                 har = pitch
 
+                # PERCLOS + 眨眼分析：每帧更新（使用标定后阈值或默认 0.32）
+                _blink_thr = EAR_THRESH if test_time >= TEST_TIMES else 0.32
+                blink_metrics = self.fatigue_detector.blink_analyzer.update(ear, _blink_thr, self._approx_fps)
+
                 if self.isShowKeyPoint:
                     for i in range(0, lm_px.shape[0], 8):
                         x, y = int(lm_px[i, 0]), int(lm_px[i, 1])
@@ -415,16 +499,11 @@ class Start_Thread(BaseThread):
                         end_point = (int(reprojectdst[end][0]), int(reprojectdst[end][1]))
                         cv2.line(frame, start_point, end_point, (0, 0, 255), 2)
 
-                left = int(rect.left())
-                top = int(rect.top())
-                right = int(rect.right())
-                bottom = int(rect.bottom())
-                fh, fw = frame.shape[:2]
-                left_c = max(0, min(left, fw - 1))
-                right_c = max(left_c + 1, min(right, fw))
-                top_c = max(0, min(top, fh - 1))
-                bottom_c = max(top_c + 1, min(bottom, fh))
-                face_img = frame[top_c:bottom_c, left_c:right_c]
+                left = rect.left()
+                top = rect.top()
+                right = rect.right()
+                bottom = rect.bottom()
+                face_img = frame[top:bottom, left:right]
                 if face_img.size > 0:
                     display_name = None
                     if face_name_probe_sec < 0:
@@ -472,6 +551,11 @@ class Start_Thread(BaseThread):
                 cv2.putText(frame, "pitch: {:5.2f}".format(pitch), (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.putText(frame, "yaw: {:5.2f}".format(yaw), (180, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
                 cv2.putText(frame, "roll: {:5.2f}".format(roll), (350, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                # PERCLOS overlay（疲劳时显示醒目颜色）
+                _pclos = blink_metrics["perclos"]
+                _pclos_color = (40, 40, 255) if _pclos > 0.25 else (0, 200, 255) if _pclos > 0.12 else (200, 200, 200)
+                cv2.putText(frame, "pclos:{:.2f} blk:{:.1f}/m".format(
+                    _pclos, blink_metrics["blink_rate"]), (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, _pclos_color, 2)
 
                 # 动态阈值：每帧最多累计一次（整图单脸标定）
                 if test_time < TEST_TIMES:
@@ -483,32 +567,27 @@ class Start_Thread(BaseThread):
                         EAR_THRESH = ear_sum / TEST_TIMES
                         MAR_THRESH = mar_sum / TEST_TIMES
                         HAR_THRESH = har_sum / TEST_TIMES
-                        print('眼睛长宽比ear 100次取平均的阈值:{:.2f} '.format(EAR_THRESH))
-                        print('嘴部长宽比mar 100次取平均的阈值:{:.2f} '.format(MAR_THRESH))
-                        print('头部俯仰角pitch 100次取平均的阈值:{:.2f} '.format(HAR_THRESH))
+                        _log.info('眼睛长宽比ear 100次取平均的阈值:%.2f', EAR_THRESH)
+                        _log.info('嘴部长宽比mar 100次取平均的阈值:%.2f', MAR_THRESH)
+                        _log.info('头部俯仰角pitch 100次取平均的阈值:%.2f', HAR_THRESH)
                         self.msg.emit('眼睛长宽比ear 100次取平均的阈值:{:.2f}'.format(EAR_THRESH))
                         self.msg.emit('嘴部长宽比mar 100次取平均的阈值:{:.2f}'.format(MAR_THRESH))
                         self.msg.emit('头部俯仰角pitch 100次取平均的阈值:{:.2f}'.format(HAR_THRESH))
                     cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 3)
-                    self.emit_picture_if_due(frame)
+                    self.picture.emit(frame)
                     if self.isClose:
                         break
                     continue
 
-                n_lm = int(lm_px.shape[0])
                 if self.isShowEye:
                     eye_pts_idx = [33, 133, 159, 145, 263, 362, 386, 374]
                     for idx in eye_pts_idx:
-                        if idx >= n_lm:
-                            break
                         x, y = int(lm_px[idx, 0]), int(lm_px[idx, 1])
                         cv2.circle(frame, (x, y), 2, (0, 255, 0), -1)
 
                 if self.isShowMouth:
                     mouth_pts_idx = [61, 291, 13, 14]
                     for idx in mouth_pts_idx:
-                        if idx >= n_lm:
-                            break
                         x, y = int(lm_px[idx, 0]), int(lm_px[idx, 1])
                         cv2.circle(frame, (x, y), 2, (0, 255, 0), -1)
 
@@ -522,6 +601,9 @@ class Start_Thread(BaseThread):
                         yawning_times += 1
                     if abs(har - HAR_THRESH) > PITCH_THRESH:
                         pitch_times += 1
+                    # PERCLOS：> 0.15 视为升高
+                    if blink_metrics["perclos"] > 0.15:
+                        perclos_high_frames += 1
 
                 else:
                     period_len = stats_period_frames
@@ -538,6 +620,10 @@ class Start_Thread(BaseThread):
 
                     if pitch_times / period_len > FATIGUE_THRESH:
                         isHeadTired = True
+
+                    isPERCLOSTired = False
+                    if perclos_high_frames / period_len > FATIGUE_THRESH:
+                        isPERCLOSTired = True
 
                     weighted_mm_msgs = False
                     if is_multimodal_enabled():
@@ -556,22 +642,28 @@ class Start_Thread(BaseThread):
                             re = closed_times / float(period_len)
                             ry = yawning_times / float(period_len)
                             rh = pitch_times / float(period_len)
+                            rp = perclos_high_frames / float(period_len)
                             sat_e = mm_cfg.visual_sat_eye()
                             sat_y = mm_cfg.visual_sat_yawn()
                             sat_h = mm_cfg.visual_sat_head()
+                            # PERCLOS 饱和比与权重（可用环境变量覆写）
+                            sat_p = float(os.environ.get("TIRED_VISUAL_SAT_PERCLOS", "0.15"))
+                            wp = float(os.environ.get("TIRED_VISUAL_W_PERCLOS", "0.10"))
                             v_eye = min(1.0, re / sat_e)
                             v_yawn = min(1.0, ry / sat_y)
                             v_head = min(1.0, rh / sat_h)
+                            v_perclos = min(1.0, rp / sat_p)
                             we, wy, wh = (
                                 mm_cfg.visual_w_eye(),
                                 mm_cfg.visual_w_yawn(),
                                 mm_cfg.visual_w_head(),
                             )
-                            sw = we + wy + wh
+                            # 原有三通道 + PERCLOS
+                            sw = we + wy + wh + wp
                             if sw <= 1e-6:
                                 visual_score = 0.0
                             else:
-                                visual_score = (we * v_eye + wy * v_yawn + wh * v_head) / sw
+                                visual_score = (we * v_eye + wy * v_yawn + wh * v_head + wp * v_perclos) / sw
                             alpha = mm_cfg.visual_smooth_alpha()
                             smooth_visual = alpha * visual_score + (1.0 - alpha) * smooth_visual
                             smooth_visual = max(0.0, min(1.0, smooth_visual))
@@ -600,7 +692,24 @@ class Start_Thread(BaseThread):
                             fused = fuse_visual_audio_dynamic(visual_for_fusion, float(audio_s))
 
                         lvl = alert_level(fused)
+                        self._update_inference_tier(fused, lvl)
                         set_last_fusion(visual_for_fusion, fused, lvl)
+                        # ---- 记录窗口数据到历史 ----
+                        if self._history_writer is not None:
+                            try:
+                                bp = blink_metrics["perclos"] if "blink_metrics" in dir() else 0.0
+                                br = blink_metrics["blink_rate"] if "blink_metrics" in dir() else 0.0
+                                self._history_writer.record_window(
+                                    ts=time.time(),
+                                    ear=ear, mar=mar, pitch=pitch,
+                                    perclos=bp, blink_rate=br,
+                                    visual_score=visual_for_fusion,
+                                    audio_score=float(audio_s) if audio_s is not None and audio_s >= 0 else None,
+                                    fused_score=fused,
+                                    alert_level=lvl,
+                                )
+                            except Exception:
+                                pass
                         lvl_cn = {"danger": "危险", "watch": "注意", "normal": "正常"}.get(lvl, lvl)
                         if lvl == "danger":
                             mm_color = (40, 40, 255)
@@ -682,6 +791,7 @@ class Start_Thread(BaseThread):
                     closed_times = 0
                     yawning_times = 0
                     pitch_times = 0
+                    perclos_high_frames = 0
 
                     isWarning = False
                     if weighted_mm_msgs:
@@ -712,6 +822,17 @@ class Start_Thread(BaseThread):
                             self.msg.emit("【危险级】您已经疲劳，请注意休息!")
                             self.window.emit("您已经疲劳，请注意休息!")
                             self.playMusic()
+                            # ---- 记录告警事件 ----
+                            if self._history_writer is not None:
+                                try:
+                                    _vis, _fus, _lvl = get_last_fusion()
+                                    self._history_writer.record_alert(
+                                        ts=time.time(),
+                                        alert_type="strong_fatigue",
+                                        fused_score=_fus,
+                                    )
+                                except Exception:
+                                    pass
                             if is_llm_agent_enabled() and groq_api_key():
                                 cd_agent = llm_agent_cooldown_sec()
                                 if now_alert - self._last_llm_agent_run >= cd_agent:
@@ -752,31 +873,24 @@ class Start_Thread(BaseThread):
                         if isWarning:
                             self._beep_warn_throttled()
 
-                self.emit_picture_if_due(frame)
+                self.picture.emit(frame)
 
                 if self.isClose:
                     break
         except Exception as e:
             error_msg = f"程序运行失败: {str(e)}"
-            print(error_msg)
+            _log.error(error_msg)
             self.msg.emit(error_msg)
         finally:
+            # ---- 结束历史会话 ----
+            if self._history_writer is not None:
+                try:
+                    self._history_writer.end_session()
+                except Exception:
+                    pass
             if is_multimodal_enabled():
-                try:
-                    video_audio_ctx.clear_playback()
-                except Exception:
-                    pass
-                try:
-                    stop_audio_loop()
-                except Exception:
-                    pass
-                try:
-                    clear_fusion_display()
-                except Exception:
-                    pass
+                video_audio_ctx.clear_playback()
+                stop_audio_loop()
+                clear_fusion_display()
             if self.cap is not None:
-                try:
-                    self.cap.release()
-                except Exception:
-                    pass
-                self.cap = None
+                self.cap.release()

@@ -1,4 +1,5 @@
 """应用入口：启动登录界面。"""
+import atexit
 import sys
 from pathlib import Path
 
@@ -6,7 +7,7 @@ try:
     from dotenv import load_dotenv
 
     _project_root = Path(__file__).resolve().parent
-    # utf-8-sig：避免 Windows 记事本保存的 UTF-8 BOM 把变量名变成「\ufeffSILICONFLOW...」导致读不到密钥
+    # utf-8-sig：避免 Windows 记事本保存的 UTF-8 BOM 把变量名变成「﻿SILICONFLOW...」导致读不到密钥
     load_dotenv(_project_root / ".env", encoding="utf-8-sig")
     # 当前工作目录下的 .env 作为补全（override=False 时不覆盖已存在的项）
     load_dotenv(Path.cwd() / ".env", encoding="utf-8-sig")
@@ -16,6 +17,18 @@ except ImportError:
 from PyQt5 import QtWidgets
 
 from src.app.auth_windows import LoginWindow, RegistrationWindow
+
+
+def _atexit_cleanup() -> None:
+    """进程退出时的兜底清理（避免 pygame mixer 等资源未释放）。"""
+    try:
+        from pygame import mixer
+        mixer.quit()
+    except Exception:
+        pass
+
+
+atexit.register(_atexit_cleanup)
 
 
 if __name__ == "__main__":

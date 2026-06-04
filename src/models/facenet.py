@@ -2,6 +2,10 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from src.utils.logger import get_logger
+
+_log = get_logger(__name__)
+
 
 class BasicConv2d(nn.Module):
 
@@ -265,7 +269,7 @@ class InceptionResnetV1(nn.Module):
         if self.is_train:
             # 训练用
             x = self.output(prelogits)
-            print('is_train:{x}')
+            _log.debug("FaceNet forward: is_train mode, num_classes=%d", x.shape[1] if hasattr(x, 'shape') else '?')
             # softmax
         #             x = self.softmax(x)
         else:

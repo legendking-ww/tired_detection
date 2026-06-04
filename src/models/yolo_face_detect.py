@@ -3,6 +3,10 @@ import numpy as np
 import math
 import argparse
 
+from src.utils.logger import get_logger
+
+_log = get_logger(__name__)
+
 
 class YOLO_face:
     def __init__(self, path, conf_thres=0.2, iou_thres=0.5):
@@ -127,7 +131,7 @@ class YOLO_face:
         landmarks = landmarks[mask]
 
         if len(bboxes_wh) == 0:
-            print('nothing detect')
+            _log.debug("YOLO face: nothing detected (low confidence)")
             return np.array([]), np.array([]), np.array([]), np.array([])
         # 非极大值抑制
         indices = cv2.dnn.NMSBoxes(bboxes_wh.tolist(), confidences.tolist(), self.conf_threshold,
@@ -139,7 +143,7 @@ class YOLO_face:
             landmarks = landmarks[indices]
             return mlvl_bboxes, confidences, classIds, landmarks
         else:
-            print('nothing detect')
+            _log.debug("YOLO face: nothing after NMS")
             return np.array([]), np.array([]), np.array([]), np.array([])
 
     def distance2bbox(self, points, distance, max_shape=None):

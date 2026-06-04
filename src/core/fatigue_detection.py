@@ -1,4 +1,5 @@
 import math
+from collections import deque
 
 import cv2
 import os
@@ -8,6 +9,9 @@ import urllib.request
 import numpy as np
 
 from ..utils.utils import line_pairs, reprojectsrc
+from ..utils.logger import get_logger
+
+_log = get_logger(__name__)
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -62,6 +66,131 @@ class SimpleRect:
         return self._b
 
 
+class BlinkAnalyzer:
+    """PERCLOS + 眨眼分析器。
+
+    PERCLOS (Percentage of Eyelid Closure) 是国际上公认最有效的疲劳指标。
+    本实现使用 P80 标准：眼睑遮挡超过 80% 的时间占比。
+
+    同时统计：
+    - 眨眼频率（次/分钟）
+    - 平均眨眼时长（毫秒）
+    - 最长眨眼时长（毫秒）
+
+    疲劳特征：
+    - PERCLOS 升高（>0.15 需注意，>0.30 危险）
+    - 眨眼频率降低（正常约 15-20 次/分钟，疲劳时下降到 <10）
+    - 单次眨眼时长变长（正常 100-400ms，疲劳时可达 500-800ms）
+    """
+
+    def __init__(self, window_frames: int = 150):
+        self._window_frames = max(30, window_frames)
+        self._ear_history: deque[float] = deque(maxlen=self._window_frames)
+        self._closed_history: deque[bool] = deque(maxlen=self._window_frames)
+        # 眨眼状态机
+        self._blink_active = False
+        self._blink_start_idx = 0
+        self._frame_idx = 0
+        # 存储最近 N 次眨眼 (duration_frames, duration_ms)
+        self._blink_durations: deque[tuple[int, float]] = deque(maxlen=50)
+        # 当前帧的结果缓存
+        self._last_perclos = 0.0
+        self._last_blink_rate = 0.0
+        self._last_avg_blink_ms = 0.0
+        self._last_max_blink_ms = 0.0
+        self._is_blinking = False
+
+    def update(self, ear: float, ear_threshold: float, fps: float = 30.0) -> dict:
+        """每帧调用一次。返回 PERCLOS、眨眼频率、平均/最长眨眼时长等指标。
+
+        Args:
+            ear: 当前帧的 Eye Aspect Ratio
+            ear_threshold: 标定后的个人 EAR 阈值（正常睁眼均值）
+            fps: 近似帧率，用于将帧数换算为时间
+
+        Returns:
+            dict with keys: perclos, blink_rate, avg_blink_ms, max_blink_ms, is_blinking
+        """
+        fps = max(1.0, min(120.0, fps))
+        self._frame_idx += 1
+        self._ear_history.append(ear)
+
+        # PERCLOS P80：EAR 低于阈值 80% 视为闭眼
+        closure_threshold = ear_threshold * 0.20  # 80% 遮挡
+        is_closed = ear < closure_threshold
+        self._closed_history.append(is_closed)
+
+        # 眨眼检测：闭眼 → 睁眼的转换（一次完整眨眼）
+        if is_closed and not self._blink_active:
+            self._blink_active = True
+            self._blink_start_idx = self._frame_idx
+        elif not is_closed and self._blink_active:
+            self._blink_active = False
+            duration_frames = self._frame_idx - self._blink_start_idx
+            # 只计入合理范围（2-30 帧 ≈ 67ms-1000ms @30fps）
+            if 2 <= duration_frames <= 30:
+                duration_ms = (duration_frames / fps) * 1000.0
+                self._blink_durations.append((duration_frames, duration_ms))
+        self._is_blinking = self._blink_active
+
+        # 计算指标
+        total = len(self._closed_history)
+        self._last_perclos = sum(self._closed_history) / total if total > 0 else 0.0
+
+        if self._blink_durations:
+            durations_ms = [d[1] for d in self._blink_durations]
+            self._last_avg_blink_ms = sum(durations_ms) / len(durations_ms)
+            self._last_max_blink_ms = max(durations_ms)
+        else:
+            self._last_avg_blink_ms = 0.0
+            self._last_max_blink_ms = 0.0
+
+        # 眨眼频率：最近 window 内的眨眼次数 → 每分钟
+        recent_window_sec = total / fps
+        if recent_window_sec > 0 and self._blink_durations:
+            recent_blinks = sum(1 for d in self._blink_durations if d[0] > self._frame_idx - total)
+            self._last_blink_rate = (recent_blinks / recent_window_sec) * 60.0
+        else:
+            self._last_blink_rate = 0.0
+
+        return {
+            "perclos": self._last_perclos,
+            "blink_rate": self._last_blink_rate,
+            "avg_blink_ms": self._last_avg_blink_ms,
+            "max_blink_ms": self._last_max_blink_ms,
+            "is_blinking": self._is_blinking,
+        }
+
+    @property
+    def perclos(self) -> float:
+        return self._last_perclos
+
+    @property
+    def blink_rate(self) -> float:
+        return self._last_blink_rate
+
+    @property
+    def avg_blink_ms(self) -> float:
+        return self._last_avg_blink_ms
+
+    @property
+    def max_blink_ms(self) -> float:
+        return self._last_max_blink_ms
+
+    def reset(self) -> None:
+        """重置所有状态（新会话或标定后调用）。"""
+        self._ear_history.clear()
+        self._closed_history.clear()
+        self._blink_durations.clear()
+        self._blink_active = False
+        self._frame_idx = 0
+        self._last_perclos = 0.0
+        self._last_blink_rate = 0.0
+        self._last_avg_blink_ms = 0.0
+        self._last_max_blink_ms = 0.0
+        self._is_blinking = False
+
+
 class FatigueDetector:
     def __init__(self):
         self.detector = None
@@ -79,6 +208,9 @@ class FatigueDetector:
         self._face_landmarker = None
         self._mp_image_cls = None
         self._mp_image_format = None
+
+        # PERCLOS + 眨眼分析
+        self.blink_analyzer = BlinkAnalyzer(window_frames=150)
 
         self.load_models()
 
@@ -107,7 +239,7 @@ class FatigueDetector:
             except Exception as e:
                 self.device = None
                 self.face_net = None
-                print(f"FaceNet load skipped: {e}")
+                _log.warning("FaceNet load skipped: %s", e)
 
             try:
                 from ..models.yolo_face_detect import YOLO_face
@@ -118,7 +250,7 @@ class FatigueDetector:
                 self.yolo_face = YOLO_face(yolo_path)
             except Exception as e:
                 self.yolo_face = None
-                print(f"YOLO face load skipped: {e}")
+                _log.warning("YOLO face load skipped: %s", e)
 
             if mp is None:
                 raise ImportError("mediapipe is not installed. Run: pip install mediapipe")
@@ -133,9 +265,9 @@ class FatigueDetector:
                         min_tracking_confidence=0.5,
                     )
                     self._lm_backend = "legacy_mesh"
-                    print("Models loaded OK (MediaPipe solutions.face_mesh — 与 OpenCV 摄像头脚本一致)")
+                    _log.info("Models loaded OK (MediaPipe solutions.face_mesh)")
                 except Exception as e:
-                    print(f"face_mesh load skipped: {e}")
+                    _log.warning("face_mesh load skipped: %s", e)
                     self._legacy_face_mesh = None
 
             if self._lm_backend is None:
@@ -164,15 +296,13 @@ class FatigueDetector:
                 )
                 self._face_landmarker = FaceLandmarker.create_from_options(options)
                 self._lm_backend = "tasks"
-                print(
-                    "Models loaded OK (MediaPipe Tasks FaceLandmarker；IMAGE+detect)"
-                )
+                _log.info("Models loaded OK (MediaPipe Tasks FaceLandmarker; IMAGE+detect)")
 
             if self._lm_backend is None:
                 raise RuntimeError("无法加载任何人脸关键点后端（face_mesh 与 FaceLandmarker 均失败）")
         except Exception as e:
             self.last_model_error = str(e)
-            print(f"Model load failed: {str(e)}")
+            _log.error("Model load failed: %s", e)
 
     def _ensure_face_landmarker_model(self) -> str:
         """
@@ -193,7 +323,7 @@ class FatigueDetector:
             "https://storage.googleapis.com/mediapipe-models/"
             "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
         )
-        print(f"Downloading FaceLandmarker model to: {primary}")
+        _log.info("Downloading FaceLandmarker model to: %s", primary)
         tmp_path = primary + ".download"
         try:
             urllib.request.urlretrieve(url, tmp_path)
@@ -260,7 +390,7 @@ class FatigueDetector:
             face_feat = face_feat_tensor.detach().cpu().numpy()
             return face_feat
         except Exception as e:
-            print(f"Feature extract failed: {str(e)}")
+            _log.warning("Feature extract failed: %s", e)
             return None
 
     def process_frame(self, frame):
@@ -603,11 +733,13 @@ class FatigueDetector:
         except Exception as e:
             if not self._analyze_face_error_logged:
                 self._analyze_face_error_logged = True
-                print(
-                    "[FatigueDetector] analyze_face: 已有 landmark 但 EAR/MAR/姿态或框计算失败（仅打印一次）:",
-                    repr(e),
+                _log.error(
+                    "[FatigueDetector] analyze_face: landmarks present but EAR/MAR/pose/bbox calc failed (logged once): %s",
+                    e,
                 )
             return None
+        blink = self.blink_analyzer  # cached values, caller should update() with calibrated threshold
+
         return {
             "landmarks": lm_px,
             "ear": ear,
@@ -617,6 +749,11 @@ class FatigueDetector:
             "yaw": yaw,
             "roll": roll,
             "bbox_rect": bbox_rect,
+            "perclos": blink.perclos,
+            "blink_rate": blink.blink_rate,
+            "avg_blink_ms": blink.avg_blink_ms,
+            "max_blink_ms": blink.max_blink_ms,
+            "is_blinking": blink._is_blinking,
         }
 
     def detect_fatigue(self, frame, gray, rects, ear_threshold=0.32, mar_threshold=0.55, har_threshold=0, fatigue_threshold=0.4, pitch_threshold=5):
@@ -647,5 +784,8 @@ class FatigueDetector:
                 "is_eye_tired": is_eye_tired,
                 "is_yawn_tired": is_yawn_tired,
                 "is_head_tired": is_head_tired,
+                "perclos": analysis.get("perclos", 0.0),
+                "blink_rate": analysis.get("blink_rate", 0.0),
+                "avg_blink_ms": analysis.get("avg_blink_ms", 0.0),
             }
         ]

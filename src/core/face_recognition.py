@@ -13,6 +13,9 @@ import numpy as np
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 from src.core.fatigue_detection import FatigueDetector
+from src.utils.logger import get_logger
+
+_log = get_logger(__name__)
 
 _PBKDF2_ITERS = 200_000
 _PWD_PREFIX = "pbkdf2_sha256$"
@@ -97,7 +100,7 @@ class FaceRecognition:
             conn = sqlite3.connect(self.db_path)
             return conn
         except sqlite3.Error as e:
-            print(f"数据库连接错误: {e}")
+            _log.error("数据库连接错误: %s", e)
             return None
     
     def create_tables(self):
@@ -126,9 +129,9 @@ class FaceRecognition:
                     )
                 ''')
                 conn.commit()
-                print("数据库表创建成功")
+                _log.info("数据库表创建成功")
             except sqlite3.Error as e:
-                print(f"数据库表创建错误: {e}")
+                _log.error("数据库表创建错误: %s", e)
             finally:
                 conn.close()
     
@@ -142,13 +145,13 @@ class FaceRecognition:
                 cursor.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, ph))
                 conn.commit()
                 user_id = cursor.lastrowid
-                print(f"用户注册成功，ID: {user_id}")
+                _log.info("用户注册成功，ID: %s", user_id)
                 return user_id
             except sqlite3.IntegrityError:
-                print("用户名已存在")
+                _log.warning("用户名已存在")
                 return None
             except Exception as e:
-                print(f"注册失败: {e}")
+                _log.error("注册失败: %s", e)
                 return None
             finally:
                 conn.close()
@@ -179,7 +182,7 @@ class FaceRecognition:
                 conn.commit()
             return user_id
         except Exception as e:
-            print(f"登录校验失败: {e}")
+            _log.error("登录校验失败: %s", e)
             return None
         finally:
             conn.close()
@@ -189,7 +192,7 @@ class FaceRecognition:
         try:
             ok, reason = self.embedder_status()
             if not ok:
-                print(f"人脸注册不可用: {reason}")
+                _log.warning("人脸注册不可用: %s", reason)
                 return False
 
             # 提取人脸特征
@@ -206,21 +209,21 @@ class FaceRecognition:
                         cursor = conn.cursor()
                         cursor.execute("INSERT INTO faces (user_id, name, features) VALUES (?, ?, ?)", (user_id, name, features_json))
                         conn.commit()
-                        print("人脸注册成功")
+                        _log.info("人脸注册成功")
                         return True
                     except Exception as e:
-                        print(f"人脸注册失败: {e}")
+                        _log.error("人脸注册失败: %s", e)
                         return False
                     finally:
                         conn.close()
                 else:
-                    print("数据库连接失败")
+                    _log.error("数据库连接失败")
                     return False
             else:
-                print("特征提取失败：人脸图像过小/通道不对，或模型前向失败")
+                _log.warning("特征提取失败：人脸图像过小/通道不对，或模型前向失败")
                 return False
         except Exception as e:
-            print(f"人脸注册失败: {e}")
+            _log.error("人脸注册失败: %s", e)
             return False
     
     def get_all_face_features(self):
@@ -240,13 +243,13 @@ class FaceRecognition:
                         face_data.append((face_id, name, features))
                     return face_data
                 except Exception as e:
-                    print(f"获取人脸特征失败: {e}")
+                    _log.warning("获取人脸特征失败: %s", e)
                     return []
                 finally:
                     conn.close()
             return []
         except Exception as e:
-            print(f"获取人脸特征失败: {e}")
+            _log.warning("获取人脸特征失败: %s", e)
             return []
     
     def recognize_face(self, face_img):
@@ -256,7 +259,7 @@ class FaceRecognition:
             ok, reason = self.embedder_status()
             if not ok:
                 if not self._warned_embedder:
-                    print(f"人脸识别不可用: {reason}")
+                    _log.warning("人脸识别不可用: %s", reason)
                     self._warned_embedder = True
                 return None
 
@@ -271,7 +274,7 @@ class FaceRecognition:
             face_data = self.get_all_face_features()
             if not face_data:
                 if os.environ.get("TIRED_FACE_RECO_DEBUG") == "1":
-                    print("数据库中没有人脸数据")
+                    _log.info("数据库中没有人脸数据")
                 return None
             
             # 计算相似度
@@ -279,37 +282,37 @@ class FaceRecognition:
             best_match = None
             _dbg = os.environ.get("TIRED_FACE_RECO_DEBUG") == "1"
             if _dbg:
-                print(f"数据库中有 {len(face_data)} 个人脸数据")
+                _log.debug("数据库中有 %d 个人脸数据", len(face_data))
             for face_id, name, db_feat in face_data:
                 if _dbg:
-                    print(f"比较人脸: {name}")
+                    _log.debug("比较人脸: %s", name)
                 try:
                     db_vec = self._l2_normalize(self._flatten_embedding(db_feat))
                     dist = float(np.linalg.norm(current_feat - db_vec))
                     if _dbg:
-                        print(f"距离: {dist}")
+                        _log.debug("距离: %.4f", dist)
                     if dist < min_dist:
                         min_dist = dist
                         best_match = name
                 except Exception as e:
                     if _dbg:
-                        print(f"计算距离失败: {e}")
+                        _log.debug("计算距离失败: %s", e)
                     continue
             
             if _dbg:
-                print(f"最小距离: {min_dist}")
+                _log.debug("最小距离: %.4f", min_dist)
             if min_dist < self.match_thresh:
                 if _dbg:
-                    print(f"识别成功: {best_match}")
+                    _log.info("识别成功: %s", best_match)
                 return best_match
             if _dbg:
-                print("识别失败: 距离超过阈值")
+                _log.debug("识别失败: 距离超过阈值")
             return None
         except Exception as e:
-            print(f"人脸识别失败: {e}")
+            _log.error("人脸识别失败: %s", e)
             return None
     
     def close_db(self):
         """关闭数据库连接"""
         # 由于每个方法都创建了自己的连接，这里不需要做任何事情
-        print("数据库连接管理完成")
+        _log.debug("数据库连接管理完成")
